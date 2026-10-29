@@ -1052,4 +1052,13 @@ inline std::optional<size_t> FPGetDataSize(Imm<2> type) {
     return std::nullopt;
 }
 
+// x86Code: FEAT_FP16 scalar arithmetic in binary32. Widening is exact and add/sub/mul/div/sqrt/min/max of two
+// binary16 values rounded once to binary32 and then to binary16 give the correctly rounded binary16 result.
+inline IR::U32 FP16ToSingle(TranslatorVisitor& v, Vec n) {
+    return v.ir.FPHalfToSingle(v.V_scalar(16, n), v.ir.current_location->FPCR().RMode());
+}
+inline void SingleToFP16(TranslatorVisitor& v, Vec d, const IR::U32& x) {
+    v.V_scalar(16, d, v.ir.FPSingleToHalf(x, v.ir.current_location->FPCR().RMode()));
+}
+
 }  // namespace Dynarmic::A64

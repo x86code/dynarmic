@@ -45,8 +45,12 @@ bool TranslatorVisitor::FNEG_float(Imm<2> type, Vec Vn, Vec Vd) {
 
 bool TranslatorVisitor::FSQRT_float(Imm<2> type, Vec Vn, Vec Vd) {
     const auto datasize = FPGetDataSize(type);
-    if (!datasize || *datasize == 16) {
+    if (!datasize) {
         return UnallocatedEncoding();
+    }
+    if (*datasize == 16) {  // x86Code: FEAT_FP16 via binary32
+        SingleToFP16(*this, Vd, ir.FPSqrt(FP16ToSingle(*this, Vn)));
+        return true;
     }
 
     const IR::U32U64 operand = V_scalar(*datasize, Vn);

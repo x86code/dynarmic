@@ -9,13 +9,14 @@ namespace Dynarmic::A64 {
 namespace {
 bool FPCompare(TranslatorVisitor& v, Imm<2> type, Vec Vm, Cond cond, Vec Vn, Imm<4> nzcv, bool exc_on_qnan) {
     const auto datasize = FPGetDataSize(type);
-    if (!datasize || *datasize == 16) {
+    if (!datasize) {
         return v.UnallocatedEncoding();
     }
     const u32 flags = nzcv.ZeroExtend<u32>() << 28;
 
-    const IR::U32U64 operand1 = v.V_scalar(*datasize, Vn);
-    const IR::U32U64 operand2 = v.V_scalar(*datasize, Vm);
+    // x86Code: FEAT_FP16 compares in binary32 (exact)
+    const IR::U32U64 operand1 = *datasize == 16 ? IR::U32U64(FP16ToSingle(v, Vn)) : IR::U32U64(v.V_scalar(*datasize, Vn));
+    const IR::U32U64 operand2 = *datasize == 16 ? IR::U32U64(FP16ToSingle(v, Vm)) : IR::U32U64(v.V_scalar(*datasize, Vm));
 
     const IR::NZCV then_flags = v.ir.FPCompare(operand1, operand2, exc_on_qnan);
     const IR::NZCV else_flags = v.ir.NZCVFromPackedFlags(v.ir.Imm32(flags));
