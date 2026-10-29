@@ -42,8 +42,8 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
         .ret_rip = iter->second.resume_rip,
     };
 
-    if (iter->second.recompile) {
-        const auto marker = iter->second.marker;
+    if (const auto mit = fastmem_recompile_markers.find(rip_); mit != fastmem_recompile_markers.end()) {
+        const auto marker = mit->second;
         do_not_fastmem.insert(marker);
         InvalidateBasicBlocks({std::get<0>(marker)});
     }
@@ -104,14 +104,14 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
-                mcl::bit_cast<u64>(location),
-                FastmemPatchInfo{
-                    mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
-                    *fastmem_marker,
-                    conf.recompile_on_fastmem_failure,
-                });
+            const u64 loc = mcl::bit_cast<u64>(location);
+            fastmem_patch_info.emplace(loc, FastmemPatchInfo{
+                mcl::bit_cast<u64>(code.getCurr()),
+                mcl::bit_cast<u64>(wrapped_fn),
+            });
+            if (conf.recompile_on_fastmem_failure) {
+                fastmem_recompile_markers.emplace(loc, *fastmem_marker);
+            }
 
             EmitCheckMemoryAbort(ctx, inst, end.get());
             code.jmp(*end, code.T_NEAR);
@@ -191,14 +191,14 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
-                mcl::bit_cast<u64>(location),
-                FastmemPatchInfo{
-                    mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
-                    *fastmem_marker,
-                    conf.recompile_on_fastmem_failure,
-                });
+            const u64 loc = mcl::bit_cast<u64>(location);
+            fastmem_patch_info.emplace(loc, FastmemPatchInfo{
+                mcl::bit_cast<u64>(code.getCurr()),
+                mcl::bit_cast<u64>(wrapped_fn),
+            });
+            if (conf.recompile_on_fastmem_failure) {
+                fastmem_recompile_markers.emplace(loc, *fastmem_marker);
+            }
 
             EmitCheckMemoryAbort(ctx, inst, end.get());
             code.jmp(*end, code.T_NEAR);
@@ -373,14 +373,14 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
-        fastmem_patch_info.emplace(
-            mcl::bit_cast<u64>(location),
-            FastmemPatchInfo{
-                mcl::bit_cast<u64>(code.getCurr()),
-                mcl::bit_cast<u64>(wrapped_fn),
-                *fastmem_marker,
-                conf.recompile_on_exclusive_fastmem_failure,
-            });
+        const u64 loc = mcl::bit_cast<u64>(location);
+        fastmem_patch_info.emplace(loc, FastmemPatchInfo{
+            mcl::bit_cast<u64>(code.getCurr()),
+            mcl::bit_cast<u64>(wrapped_fn),
+        });
+        if (conf.recompile_on_exclusive_fastmem_failure) {
+            fastmem_recompile_markers.emplace(loc, *fastmem_marker);
+        }
 
         code.L(*end);
 
@@ -511,14 +511,14 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
-                mcl::bit_cast<u64>(location),
-                FastmemPatchInfo{
-                    mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
-                    *fastmem_marker,
-                    conf.recompile_on_exclusive_fastmem_failure,
-                });
+            const u64 loc = mcl::bit_cast<u64>(location);
+            fastmem_patch_info.emplace(loc, FastmemPatchInfo{
+                mcl::bit_cast<u64>(code.getCurr()),
+                mcl::bit_cast<u64>(wrapped_fn),
+            });
+            if (conf.recompile_on_exclusive_fastmem_failure) {
+                fastmem_recompile_markers.emplace(loc, *fastmem_marker);
+            }
 
             code.cmp(al, 0);
             code.setz(status.cvt8());

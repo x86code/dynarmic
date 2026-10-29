@@ -95,7 +95,7 @@ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, I
             code.nop(8 - misalign);
         }
     }
-    patch_information[target].mov_rcx.push_back(code.getCurr());
+    patch_information[target].add(PatchInformation::MOV_RCX, code.getCurr());
     EmitPatchMovRcx(target_code_ptr);
 
     code.mov(qword[r15 + index_reg * 8 + code.GetJitStateInfo().offsetof_rsb_location_descriptors], loc_desc_reg);
@@ -366,24 +366,22 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
     const PatchInformation& patch_info = patch_information[target_desc];
     patching = true;
 
-    for (CodePtr location : patch_info.jg) {
+    for (const auto& [kind, location] : patch_info.sites) {
         code.SetCodePtr(location);
-        EmitPatchJg(target_desc, target_code_ptr);
-    }
-
-    for (CodePtr location : patch_info.jz) {
-        code.SetCodePtr(location);
-        EmitPatchJz(target_desc, target_code_ptr);
-    }
-
-    for (CodePtr location : patch_info.jmp) {
-        code.SetCodePtr(location);
-        EmitPatchJmp(target_desc, target_code_ptr);
-    }
-
-    for (CodePtr location : patch_info.mov_rcx) {
-        code.SetCodePtr(location);
-        EmitPatchMovRcx(target_code_ptr);
+        switch (kind) {
+        case PatchInformation::JG:
+            EmitPatchJg(target_desc, target_code_ptr);
+            break;
+        case PatchInformation::JZ:
+            EmitPatchJz(target_desc, target_code_ptr);
+            break;
+        case PatchInformation::JMP:
+            EmitPatchJmp(target_desc, target_code_ptr);
+            break;
+        case PatchInformation::MOV_RCX:
+            EmitPatchMovRcx(target_code_ptr);
+            break;
+        }
     }
 
     patching = false;

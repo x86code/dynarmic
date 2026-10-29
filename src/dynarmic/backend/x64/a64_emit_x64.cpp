@@ -161,6 +161,7 @@ void A64EmitX64::ClearCache() {
     block_ranges.ClearCache();
     ClearFastDispatchTable();
     fastmem_patch_info.clear();
+    fastmem_recompile_markers.clear();
     unlinked_heads.clear();
 }
 
@@ -666,7 +667,7 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
         if (conf.shared_translations) {
             code.align(8);
         }
-        patch_information[terminal.next].jg.push_back(code.getCurr());
+        patch_information[terminal.next].add(PatchInformation::JG, code.getCurr());
         if (const auto next_bb = GetBasicBlock(terminal.next)) {
             EmitPatchJg(terminal.next, next_bb->entrypoint);
         } else {
@@ -678,7 +679,7 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
         if (conf.shared_translations) {
             code.align(8);
         }
-        patch_information[terminal.next].jz.push_back(code.getCurr());
+        patch_information[terminal.next].add(PatchInformation::JZ, code.getCurr());
         if (const auto next_bb = GetBasicBlock(terminal.next)) {
             EmitPatchJz(terminal.next, next_bb->entrypoint);
         } else {
@@ -702,7 +703,7 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
     if (conf.shared_translations) {
         code.align(8);
     }
-    patch_information[terminal.next].jmp.push_back(code.getCurr());
+    patch_information[terminal.next].add(PatchInformation::JMP, code.getCurr());
     if (auto next_bb = GetBasicBlock(terminal.next)) {
         EmitPatchJmp(terminal.next, next_bb->entrypoint);
     } else {

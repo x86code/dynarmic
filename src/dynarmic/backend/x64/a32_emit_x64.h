@@ -98,13 +98,13 @@ protected:
 
     // Fastmem information
     using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
+    // x86Code: see a64_emit_x64.h — slim fastmem_patch_info, markers in a side map.
     struct FastmemPatchInfo {
         u64 resume_rip;
         u64 callback;
-        DoNotFastmemMarker marker;
-        bool recompile;
     };
     tsl::robin_map<u64, FastmemPatchInfo> fastmem_patch_info;
+    tsl::robin_map<u64, DoNotFastmemMarker> fastmem_recompile_markers;
     std::set<DoNotFastmemMarker> do_not_fastmem;
     std::optional<DoNotFastmemMarker> ShouldFastmem(A32EmitContext& ctx, IR::Inst* inst) const;
     FakeCall FastmemCallback(u64 rip);

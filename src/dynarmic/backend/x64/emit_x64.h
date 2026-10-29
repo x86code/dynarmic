@@ -122,11 +122,12 @@ protected:
     virtual void EmitTerminalImpl(IR::Term::CheckHalt terminal, IR::LocationDescriptor initial_location, bool is_single_step) = 0;
 
     // Patching
+    // x86Code: one tagged vector instead of four std::vectors (96 B/value → 24 B).
+    // With ~1M pending link targets that cut the robin_map bucket array ~224 MB → ~80 MB.
     struct PatchInformation {
-        std::vector<CodePtr> jg;
-        std::vector<CodePtr> jz;
-        std::vector<CodePtr> jmp;
-        std::vector<CodePtr> mov_rcx;
+        enum Kind : u8 { JG = 0, JZ = 1, JMP = 2, MOV_RCX = 3 };
+        std::vector<std::pair<Kind, CodePtr>> sites;
+        void add(Kind k, CodePtr p) { sites.emplace_back(k, p); }
     };
     void Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
     // x86Code: shared translations. Patch sites are aligned so a link/unlink is one atomic 8-byte store (other threads

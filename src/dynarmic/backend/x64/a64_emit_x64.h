@@ -105,13 +105,15 @@ protected:
 
     // Fastmem information
     using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
+    // x86Code: keep the fault→fallback map to two u64s. The marker/recompile flag live in a
+    // side map that stays empty when recompile_on_fastmem_failure is false (our default),
+    // shrinking ~1.5M-entry bucket storage from ~224 MB (56 B/entry) to ~128 MB (32 B/entry).
     struct FastmemPatchInfo {
         u64 resume_rip;
         u64 callback;
-        DoNotFastmemMarker marker;
-        bool recompile;
     };
     tsl::robin_map<u64, FastmemPatchInfo> fastmem_patch_info;
+    tsl::robin_map<u64, DoNotFastmemMarker> fastmem_recompile_markers;
     std::set<DoNotFastmemMarker> do_not_fastmem;
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
     FakeCall FastmemCallback(u64 rip);
