@@ -173,9 +173,13 @@ public:
 
     void ClearCache() {
         if (conf.shared_translations) {
+            // Must use emitter.ClearCache() (O(map size) clear of descriptors/FD/block_ranges), not a
+            // full-range InvalidateCacheRanges. Invalidate leaves block_ranges populated (dynarmic TODO)
+            // and walks every block under the shared mutex — after minutes of SpringBoard that stalls
+            // every thread for seconds and surfaces as BKS/XPC assert failures.
             std::unique_lock lock{shared->mutex()};
             ++shared->invalidate_gen;
-            emitter.InvalidateCacheRanges(boost::icl::interval_set<u64>{boost::icl::discrete_interval<u64>::closed(0, ~u64(0))});
+            emitter.ClearCache();
             return;
         }
         std::unique_lock lock{invalidation_mutex};

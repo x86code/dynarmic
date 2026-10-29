@@ -33,7 +33,11 @@ tsl::robin_set<IR::LocationDescriptor> BlockRangeInformation<ProgramCounterType>
             }
         }
     }
-    // TODO: EFFICIENCY: Remove ranges that are to be erased.
+    // Drop the invalidated intervals so repeated IVAU/IALLU does not leave the map growing forever
+    // (shared translation caches call this under a process-wide mutex; a leak stalls every thread).
+    for (auto invalidate_interval : ranges) {
+        block_ranges.erase(invalidate_interval);
+    }
     return erase_locations;
 }
 

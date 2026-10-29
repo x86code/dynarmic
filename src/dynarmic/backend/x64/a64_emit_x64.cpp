@@ -169,7 +169,15 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
 }
 
 void A64EmitX64::ClearFastDispatchTable() {
-    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+    if (!conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+        return;
+    }
+    if (conf.shared_translations) {
+        // Concurrent FD lookups use aligned 16-byte loads; clear each entry the same way Unpatch does.
+        for (auto& entry : fast_dispatch_table) {
+            _mm_store_si128(reinterpret_cast<__m128i*>(&entry), _mm_set_epi64x(0, -1));
+        }
+    } else {
         fast_dispatch_table.fill({});
     }
 }
