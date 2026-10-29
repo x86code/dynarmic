@@ -75,6 +75,9 @@ struct Jit::SharedCode final {
     Optimization::PolyfillOptions polyfill_options;
     std::recursive_mutex& mutex() { return emitter.shared_mutex; }
     Jit::SharedStats stats;  // under mutex()
+    // Bumped under mutex() on every shared Invalidate/Clear so a thread that translated IR
+    // without the lock can detect a concurrent invalidation and discard that IR.
+    u64 invalidate_gen = 0;
 };
 
 Jit::SharedStats Jit::GetSharedStats(const SharedCode& shared) {
@@ -171,6 +174,7 @@ public:
     void ClearCache() {
         if (conf.shared_translations) {
             std::unique_lock lock{shared->mutex()};
+            ++shared->invalidate_gen;
             emitter.InvalidateCacheRanges(boost::icl::interval_set<u64>{boost::icl::discrete_interval<u64>::closed(0, ~u64(0))});
             return;
         }
@@ -184,6 +188,7 @@ public:
         const auto range = boost::icl::discrete_interval<u64>::closed(start_address, end_address);
         if (conf.shared_translations) {
             std::unique_lock lock{shared->mutex()};
+            ++shared->invalidate_gen;
             emitter.InvalidateCacheRanges(boost::icl::interval_set<u64>{range});
             return;
         }
@@ -325,56 +330,79 @@ private:
     }
 
     CodePtr GetBlock(IR::LocationDescriptor current_location) {
+        // Shared mode: hold the mutex only for map lookup and Emit. IR Translate/opts run unlocked so
+        // other threads can still LookupBlock/Emit. A concurrent Invalidate bumps invalidate_gen; if it
+        // changed while we translated, discard the IR and retry (the map may already have a fresh block).
         std::unique_lock lock{shared->mutex(), std::defer_lock};
-        if (conf.shared_translations) {
-            lock.lock();
-        }
-        shared->stats.lookups++;
-        if (auto block = emitter.GetBasicBlock(current_location))
-            return block->entrypoint;
-        timespec t0;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        const auto start_code = block_of_code.getCurr<const u8*>();
+        for (;;) {
+            if (conf.shared_translations) {
+                lock.lock();
+            }
+            shared->stats.lookups++;
+            if (auto block = emitter.GetBasicBlock(current_location))
+                return block->entrypoint;
+            const u64 gen_at_miss = conf.shared_translations ? shared->invalidate_gen : 0;
+            if (conf.shared_translations) {
+                lock.unlock();
+            }
 
-        constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
-        if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
-            // Shared code is never freed: other threads may be inside it (or return into it from native calls).
-            ASSERT_MSG(!conf.shared_translations, "dynarmic: shared code cache full ({} bytes)", conf.code_cache_size);
-            // Immediately evacuate cache
-            invalidate_entire_cache = true;
-            PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
-        }
-        block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
+            timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        // JIT Compile
-        const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
-        IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
-                                            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
-        Optimization::PolyfillPass(ir_block, polyfill_options);
-        Optimization::A64CallbackConfigPass(ir_block, conf);
-        Optimization::NamingPass(ir_block);
-        if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
-            Optimization::A64GetSetElimination(ir_block);
-            Optimization::DeadCodeElimination(ir_block);
+            // JIT Compile (unlocked when shared): MemoryReadCode must not need the shared mutex.
+            const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
+            IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
+                                                {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+            Optimization::PolyfillPass(ir_block, polyfill_options);
+            Optimization::A64CallbackConfigPass(ir_block, conf);
+            Optimization::NamingPass(ir_block);
+            if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
+                Optimization::A64GetSetElimination(ir_block);
+                Optimization::DeadCodeElimination(ir_block);
+            }
+            if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
+                Optimization::ConstantPropagation(ir_block);
+                Optimization::DeadCodeElimination(ir_block);
+            }
+            if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
+                Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
+            }
+            Optimization::IdentityRemovalPass(ir_block);
+            Optimization::VerificationPass(ir_block);
+            const size_t guest_instructions = ir_block.CycleCount();
+
+            if (conf.shared_translations) {
+                lock.lock();
+                if (shared->invalidate_gen != gen_at_miss) {
+                    // Memory may have changed; another thread may already have a valid block.
+                    lock.unlock();
+                    continue;
+                }
+                if (auto block = emitter.GetBasicBlock(current_location))
+                    return block->entrypoint;
+            }
+
+            constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
+            if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
+                // Shared code is never freed: other threads may be inside it (or return into it from native calls).
+                ASSERT_MSG(!conf.shared_translations, "dynarmic: shared code cache full ({} bytes)", conf.code_cache_size);
+                // Immediately evacuate cache
+                invalidate_entire_cache = true;
+                PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
+            }
+            block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
+
+            const auto start_code = block_of_code.getCurr<const u8*>();
+            // Emit may re-enter GetBlock via LookupBlock (block linking); recursive_mutex allows that.
+            const CodePtr entrypoint = emitter.Emit(ir_block).entrypoint;
+            timespec t1;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            shared->stats.blocks++;
+            shared->stats.guest_instructions += guest_instructions;
+            shared->stats.code_bytes += block_of_code.getCurr<const u8*>() - start_code;
+            shared->stats.translate_ns += (t1.tv_sec - t0.tv_sec) * 1000000000ull + t1.tv_nsec - t0.tv_nsec;
+            return entrypoint;
         }
-        if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
-            Optimization::ConstantPropagation(ir_block);
-            Optimization::DeadCodeElimination(ir_block);
-        }
-        if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
-            Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
-        }
-        Optimization::IdentityRemovalPass(ir_block);
-        Optimization::VerificationPass(ir_block);
-        const size_t guest_instructions = ir_block.CycleCount();
-        const CodePtr entrypoint = emitter.Emit(ir_block).entrypoint;
-        timespec t1;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        shared->stats.blocks++;
-        shared->stats.guest_instructions += guest_instructions;
-        shared->stats.code_bytes += block_of_code.getCurr<const u8*>() - start_code;
-        shared->stats.translate_ns += (t1.tv_sec - t0.tv_sec) * 1000000000ull + t1.tv_nsec - t0.tv_nsec;
-        return entrypoint;
     }
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
