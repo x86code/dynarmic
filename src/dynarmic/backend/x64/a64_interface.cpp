@@ -68,12 +68,20 @@ public:
     ~Impl() = default;
 
     HaltReason Run() {
-        ASSERT(!is_executing);
-        PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
+        // x86code: Run may be re-entered from a callback (a native function calling back into guest code on the same
+        // thread). The caller saves and restores the guest state around the nested run. Code may only be freed at the
+        // outermost level: the outer run is still inside a block. A nested run passes cache invalidation requests on.
+        const bool nested = run_depth > 0;
+        if (!nested) {
+            PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
+        }
 
         is_executing = true;
+        ++run_depth;
         SCOPE_EXIT {
-            this->is_executing = false;
+            if (--this->run_depth == 0) {
+                this->is_executing = false;
+            }
         };
 
         // TODO: Check code alignment
@@ -91,7 +99,11 @@ public:
 
         const HaltReason hr = block_of_code.RunCode(&jit_state, current_code_ptr);
 
-        PerformRequestedCacheInvalidation(hr);
+        if (!nested) {
+            PerformRequestedCacheInvalidation(hr);
+        } else if (Has(hr, HaltReason::CacheInvalidation)) {
+            Atomic::Or(&jit_state.halt_reason, static_cast<u32>(HaltReason::CacheInvalidation));
+        }
 
         return hr;
     }
@@ -314,6 +326,7 @@ private:
     }
 
     bool is_executing = false;
+    size_t run_depth = 0;
 
     const UserConfig conf;
     A64JitState jit_state;
