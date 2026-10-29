@@ -289,6 +289,12 @@ struct UserConfig {
     // Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
     size_t code_cache_size = 128 * 1024 * 1024;  // bytes
 
+    /// x86Code: the translation cache is shared by several Jits (one per thread) through Jit::MakeSharedCode.
+    /// Emitted code then takes tpidr_el0/tpidrro_el0 and the exclusive monitor slot (processor_id) from the running
+    /// Jit's state, the fast dispatch table and block links are updated with atomic stores, and code is never freed
+    /// while the process runs (invalidation only unlinks blocks). callbacks must not depend on which Jit runs.
+    bool shared_translations = false;
+
     /// Internal use only
     bool very_verbose_debugging_output = false;
 };

@@ -222,6 +222,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
 template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
     ASSERT(conf.global_monitor != nullptr);
+    ASSERT_MSG(!SharedTranslations(conf), "shared translations need fastmem_exclusive_access");
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const bool ordered = IsOrdered(args[2].GetImmediateAccType());
 
@@ -273,6 +274,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
 template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
     ASSERT(conf.global_monitor != nullptr);
+    ASSERT_MSG(!SharedTranslations(conf), "shared translations need fastmem_exclusive_access");
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const bool ordered = IsOrdered(args[3].GetImmediateAccType());
 
@@ -359,7 +361,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
 
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
-    code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    EmitExclusiveSlotPointer(code, conf, tmp, false);
     code.mov(qword[tmp], vaddr);
 
     const auto fastmem_marker = ShouldFastmem(ctx, inst);
@@ -393,7 +395,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
         code.call(wrapped_fn);
     }
 
-    code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    EmitExclusiveSlotPointer(code, conf, tmp, true);
     EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
 
     EmitExclusiveUnlock(code, conf, tmp, tmp2.cvt32());
@@ -440,7 +442,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
 
     SharedLabel end = GenSharedLabel();
 
-    code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    EmitExclusiveSlotPointer(code, conf, tmp, false);
     code.mov(status, u32(1));
     code.cmp(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
     code.je(*end, code.T_NEAR);
@@ -450,7 +452,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     EmitExclusiveTestAndClear(code, conf, vaddr, tmp, rax);
 
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
-    code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    EmitExclusiveSlotPointer(code, conf, tmp, true);
 
     if constexpr (bitsize == 128) {
         code.mov(rax, qword[tmp + 0]);

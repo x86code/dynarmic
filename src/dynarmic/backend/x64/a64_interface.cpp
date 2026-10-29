@@ -4,6 +4,7 @@
  */
 
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <mutex>
 
@@ -16,6 +17,7 @@
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/devirtualize.h"
+#include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/backend/x64/jitstate_info.h"
 #include "dynarmic/common/atomic.h"
 #include "dynarmic/common/x64_disassemble.h"
@@ -55,14 +57,50 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
     };
 }
 
+// x86Code: the translation side of a Jit (code, block map, emitter, fast dispatch table). A plain Jit owns one; with
+// UserConfig::shared_translations several Jits (threads) share one. The dispatcher's block lookup finds the running
+// Jit through a thread_local (t_running), so the emitted code does not depend on which Jit runs it.
+struct Jit::SharedCode final {
+    explicit SharedCode(UserConfig conf_)
+            : conf(conf_)
+            , block_of_code(GenRunCodeCallbacks(conf.callbacks, &LookupBlockThunk, nullptr, conf), JitStateInfo{A64JitState{}}, conf.code_cache_size, GenRCP(conf))
+            , emitter(block_of_code, conf, nullptr)
+            , polyfill_options(GenPolyfillOptions(block_of_code)) {}
+
+    static CodePtr LookupBlockThunk(void*);
+
+    const UserConfig conf;
+    BlockOfCode block_of_code;
+    A64EmitX64 emitter;
+    Optimization::PolyfillOptions polyfill_options;
+    std::recursive_mutex& mutex() { return emitter.shared_mutex; }
+    Jit::SharedStats stats;  // under mutex()
+};
+
+Jit::SharedStats Jit::GetSharedStats(const SharedCode& shared) {
+    return shared.stats;
+}
+
+std::shared_ptr<Jit::SharedCode> Jit::MakeSharedCode(UserConfig conf) {
+    ASSERT(conf.shared_translations);
+    return std::make_shared<SharedCode>(conf);
+}
+
 struct Jit::Impl final {
 public:
-    Impl(Jit* jit, UserConfig conf)
-            : conf(conf)
-            , block_of_code(GenRunCodeCallbacks(conf.callbacks, &GetCurrentBlockThunk, this, conf), JitStateInfo{jit_state}, conf.code_cache_size, GenRCP(conf))
-            , emitter(block_of_code, conf, jit)
-            , polyfill_options(GenPolyfillOptions(block_of_code)) {
+    Impl(Jit*, UserConfig thread_conf, std::shared_ptr<SharedCode> shared_)
+            : shared(shared_ ? std::move(shared_) : std::make_shared<SharedCode>(thread_conf))
+            , conf(shared->conf)
+            , block_of_code(shared->block_of_code)
+            , emitter(shared->emitter)
+            , polyfill_options(shared->polyfill_options) {
         ASSERT(conf.page_table_address_space_bits >= 12 && conf.page_table_address_space_bits <= 64);
+        jit_state.tpidr_el0_ptr = thread_conf.tpidr_el0;
+        jit_state.tpidrro_el0_ptr = thread_conf.tpidrro_el0;
+        if (conf.global_monitor) {
+            jit_state.excl_address_ptr = GetExclusiveMonitorAddressPointer(conf.global_monitor, thread_conf.processor_id);
+            jit_state.excl_value_ptr = GetExclusiveMonitorValuePointer(conf.global_monitor, thread_conf.processor_id);
+        }
     }
 
     ~Impl() = default;
@@ -78,7 +116,10 @@ public:
 
         is_executing = true;
         ++run_depth;
+        Impl* const outer_running = t_running;
+        t_running = this;
         SCOPE_EXIT {
+            t_running = outer_running;
             if (--this->run_depth == 0) {
                 this->is_executing = false;
             }
@@ -113,7 +154,10 @@ public:
         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
 
         is_executing = true;
+        Impl* const outer_running = t_running;
+        t_running = this;
         SCOPE_EXIT {
+            t_running = outer_running;
             this->is_executing = false;
         };
 
@@ -125,22 +169,37 @@ public:
     }
 
     void ClearCache() {
+        if (conf.shared_translations) {
+            std::unique_lock lock{shared->mutex()};
+            emitter.InvalidateCacheRanges(boost::icl::interval_set<u64>{boost::icl::discrete_interval<u64>::closed(0, ~u64(0))});
+            return;
+        }
         std::unique_lock lock{invalidation_mutex};
         invalidate_entire_cache = true;
         HaltExecution(HaltReason::CacheInvalidation);
     }
 
     void InvalidateCacheRange(u64 start_address, size_t length) {
-        std::unique_lock lock{invalidation_mutex};
         const auto end_address = static_cast<u64>(start_address + length - 1);
         const auto range = boost::icl::discrete_interval<u64>::closed(start_address, end_address);
+        if (conf.shared_translations) {
+            std::unique_lock lock{shared->mutex()};
+            emitter.InvalidateCacheRanges(boost::icl::interval_set<u64>{range});
+            return;
+        }
+        std::unique_lock lock{invalidation_mutex};
         invalid_cache_ranges.add(range);
         HaltExecution(HaltReason::CacheInvalidation);
     }
 
     void Reset() {
         ASSERT(!is_executing);
-        jit_state = {};
+        A64JitState fresh{};
+        fresh.tpidr_el0_ptr = jit_state.tpidr_el0_ptr;
+        fresh.tpidrro_el0_ptr = jit_state.tpidrro_el0_ptr;
+        fresh.excl_address_ptr = jit_state.excl_address_ptr;
+        fresh.excl_value_ptr = jit_state.excl_value_ptr;
+        jit_state = fresh;
     }
 
     void HaltExecution(HaltReason hr) {
@@ -250,18 +309,15 @@ public:
         return Common::DisassembleX64(block_of_code.GetCodeBegin(), size);
     }
 
-private:
-    static CodePtr GetCurrentBlockThunk(void* thisptr) {
-        Jit::Impl* this_ = static_cast<Jit::Impl*>(thisptr);
-        return this_->GetCurrentBlock();
+    static thread_local Impl* t_running;
+    CodePtr GetCurrentBlock() {
+        return GetBlock(GetCurrentLocation());
     }
+
+private:
 
     IR::LocationDescriptor GetCurrentLocation() const {
         return IR::LocationDescriptor{jit_state.GetUniqueHash()};
-    }
-
-    CodePtr GetCurrentBlock() {
-        return GetBlock(GetCurrentLocation());
     }
 
     CodePtr GetCurrentSingleStep() {
@@ -269,11 +325,21 @@ private:
     }
 
     CodePtr GetBlock(IR::LocationDescriptor current_location) {
+        std::unique_lock lock{shared->mutex(), std::defer_lock};
+        if (conf.shared_translations) {
+            lock.lock();
+        }
+        shared->stats.lookups++;
         if (auto block = emitter.GetBasicBlock(current_location))
             return block->entrypoint;
+        timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        const auto start_code = block_of_code.getCurr<const u8*>();
 
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
+            // Shared code is never freed: other threads may be inside it (or return into it from native calls).
+            ASSERT_MSG(!conf.shared_translations, "dynarmic: shared code cache full ({} bytes)", conf.code_cache_size);
             // Immediately evacuate cache
             invalidate_entire_cache = true;
             PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
@@ -300,7 +366,15 @@ private:
         }
         Optimization::IdentityRemovalPass(ir_block);
         Optimization::VerificationPass(ir_block);
-        return emitter.Emit(ir_block).entrypoint;
+        const size_t guest_instructions = ir_block.CycleCount();
+        const CodePtr entrypoint = emitter.Emit(ir_block).entrypoint;
+        timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        shared->stats.blocks++;
+        shared->stats.guest_instructions += guest_instructions;
+        shared->stats.code_bytes += block_of_code.getCurr<const u8*>() - start_code;
+        shared->stats.translate_ns += (t1.tv_sec - t0.tv_sec) * 1000000000ull + t1.tv_nsec - t0.tv_nsec;
+        return entrypoint;
     }
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
@@ -328,19 +402,29 @@ private:
     bool is_executing = false;
     size_t run_depth = 0;
 
-    const UserConfig conf;
+    std::shared_ptr<SharedCode> shared;
+    const UserConfig& conf;
     A64JitState jit_state;
-    BlockOfCode block_of_code;
-    A64EmitX64 emitter;
-    Optimization::PolyfillOptions polyfill_options;
+    BlockOfCode& block_of_code;
+    A64EmitX64& emitter;
+    const Optimization::PolyfillOptions& polyfill_options;
 
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;
     std::mutex invalidation_mutex;
 };
 
+thread_local Jit::Impl* Jit::Impl::t_running = nullptr;
+
+CodePtr Jit::SharedCode::LookupBlockThunk(void*) {
+    return Jit::Impl::t_running->GetCurrentBlock();
+}
+
 Jit::Jit(UserConfig conf)
-        : impl(std::make_unique<Jit::Impl>(this, conf)) {}
+        : impl(std::make_unique<Jit::Impl>(this, conf, nullptr)) {}
+
+Jit::Jit(UserConfig conf, std::shared_ptr<SharedCode> shared)
+        : impl(std::make_unique<Jit::Impl>(this, conf, std::move(shared))) {}
 
 Jit::~Jit() = default;
 

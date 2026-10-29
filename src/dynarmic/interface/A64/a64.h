@@ -21,6 +21,19 @@ namespace A64 {
 class Jit final {
 public:
     explicit Jit(UserConfig conf);
+
+    /// x86Code: one translation cache (code, block map, fast dispatch table) shared by several Jits, e.g. one per
+    /// host thread of a process. conf.shared_translations must be set; conf.callbacks must be thread-agnostic.
+    struct SharedCode;
+    static std::shared_ptr<SharedCode> MakeSharedCode(UserConfig conf);
+    /// A Jit with its own guest state over a shared translation cache. Of conf only processor_id, tpidr_el0 and
+    /// tpidrro_el0 are used (they are per-thread); everything else comes from the shared cache's config.
+    Jit(UserConfig conf, std::shared_ptr<SharedCode> shared);
+    /// x86Code: translation statistics of a shared cache (profiling).
+    struct SharedStats {
+        std::uint64_t blocks = 0, guest_instructions = 0, code_bytes = 0, translate_ns = 0, lookups = 0;
+    };
+    static SharedStats GetSharedStats(const SharedCode& shared);
     ~Jit();
 
     /**

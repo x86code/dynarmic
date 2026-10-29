@@ -88,6 +88,13 @@ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, I
 
     code.mov(loc_desc_reg, target.Value());
 
+    if (atomic_patch_sites) {
+        // the imm64 of `mov rcx, imm64` (bytes 2-9) must be 8-byte aligned
+        const size_t misalign = (reinterpret_cast<uintptr_t>(code.getCurr()) + 2) & 7;
+        if (misalign) {
+            code.nop(8 - misalign);
+        }
+    }
     patch_information[target].mov_rcx.push_back(code.getCurr());
     EmitPatchMovRcx(target_code_ptr);
 
@@ -357,6 +364,7 @@ void EmitX64::EmitTerminal(IR::Terminal terminal, IR::LocationDescriptor initial
 void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const CodePtr save_code_ptr = code.getCurr();
     const PatchInformation& patch_info = patch_information[target_desc];
+    patching = true;
 
     for (CodePtr location : patch_info.jg) {
         code.SetCodePtr(location);
@@ -378,6 +386,7 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
         EmitPatchMovRcx(target_code_ptr);
     }
 
+    patching = false;
     code.SetCodePtr(save_code_ptr);
 }
 

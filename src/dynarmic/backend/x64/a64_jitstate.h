@@ -73,6 +73,13 @@ struct A64JitState {
         const u64 pc_u64 = pc & A64::LocationDescriptor::pc_mask;
         return pc_u64 | fpcr_u64;
     }
+
+    // x86Code: per-thread values that a shared translation cache (UserConfig::shared_translations) cannot bake into
+    // the code: TPIDR_EL0/TPIDRRO_EL0 locations and this thread's exclusive monitor slots.
+    std::uint64_t* tpidr_el0_ptr = nullptr;
+    const std::uint64_t* tpidrro_el0_ptr = nullptr;
+    void* excl_address_ptr = nullptr;
+    void* excl_value_ptr = nullptr;
 };
 
 #ifdef _MSC_VER

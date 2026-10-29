@@ -7,6 +7,7 @@
 
 #include <array>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <tuple>
 
@@ -51,6 +52,9 @@ public:
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
+    // x86Code: with shared_translations, guards the block map, patch/fastmem info and emission.
+    std::recursive_mutex shared_mutex;
+
 protected:
     const A64::UserConfig conf;
     A64::Jit* jit_interface;
@@ -64,7 +68,11 @@ protected:
     // x86Code: 64K entries (1 MB) instead of 1M (16 MB, all touched when cleared): there is one Jit per guest thread
     static constexpr u64 fast_dispatch_table_mask = 0xFFFF0;
     static constexpr size_t fast_dispatch_table_size = 0x10000;
-    std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
+    alignas(16) std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;  // 16-byte atomic entries when shared
+    // x86Code shared translations: original first 8 bytes of each unlinked jg/jz/jmp patch site
+    tsl::robin_map<u64, u64> unlinked_heads;
+    void EmitSharedPatchSite(int kind, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
+    void WriteSharedLinkHead(int kind, CodePtr site, CodePtr target_code_ptr);
     void ClearFastDispatchTable();
 
     void (*memory_read_128)();

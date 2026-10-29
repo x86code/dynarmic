@@ -129,6 +129,10 @@ protected:
         std::vector<CodePtr> mov_rcx;
     };
     void Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
+    // x86Code: shared translations. Patch sites are aligned so a link/unlink is one atomic 8-byte store (other threads
+    // may be executing the site); `patching` tells EmitPatch* whether it rewrites an existing site.
+    bool atomic_patch_sites = false;
+    bool patching = false;
     virtual void Unpatch(const IR::LocationDescriptor& target_desc);
     virtual void EmitPatchJg(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) = 0;
     virtual void EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) = 0;

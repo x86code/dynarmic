@@ -8,6 +8,7 @@
 
 #include "dynarmic/backend/x64/a32_emit_x64.h"
 #include "dynarmic/backend/x64/a64_emit_x64.h"
+#include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/common/spin_lock_x64.h"
 #include "dynarmic/interface/exclusive_monitor.h"
@@ -362,6 +363,27 @@ void EmitExclusiveUnlock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64
     EmitSpinLockUnlock(code, pointer, tmp);
 }
 
+// x86Code: with shared translations the running thread's monitor slots come from its A64JitState.
+template<typename UserConfig>
+bool SharedTranslations(const UserConfig& conf) {
+    if constexpr (requires { conf.shared_translations; }) {
+        return conf.shared_translations;
+    } else {
+        return false;
+    }
+}
+
+template<typename UserConfig>
+void EmitExclusiveSlotPointer(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 reg, bool value) {
+    if (SharedTranslations(conf)) {
+        code.mov(reg, qword[r15 + (value ? offsetof(A64JitState, excl_value_ptr) : offsetof(A64JitState, excl_address_ptr))]);
+    } else if (value) {
+        code.mov(reg, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    } else {
+        code.mov(reg, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    }
+}
+
 template<typename UserConfig>
 void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 vaddr, Xbyak::Reg64 pointer, Xbyak::Reg64 tmp) {
     if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
@@ -371,11 +393,16 @@ void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak:
     code.mov(tmp, 0xDEAD'DEAD'DEAD'DEAD);
     const size_t processor_count = GetExclusiveMonitorProcessorCount(conf.global_monitor);
     for (size_t processor_index = 0; processor_index < processor_count; processor_index++) {
-        if (processor_index == conf.processor_id) {
+        const bool shared = SharedTranslations(conf);
+        if (!shared && processor_index == conf.processor_id) {
             continue;
         }
         Xbyak::Label ok;
         code.mov(pointer, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, processor_index)));
+        if (shared) {
+            code.cmp(pointer, qword[r15 + offsetof(A64JitState, excl_address_ptr)]);
+            code.je(ok);
+        }
         code.cmp(qword[pointer], vaddr);
         code.jne(ok);
         code.mov(qword[pointer], tmp);

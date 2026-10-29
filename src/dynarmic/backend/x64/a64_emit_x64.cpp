@@ -4,6 +4,8 @@
  */
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
+#include <immintrin.h>
+#include <cstring>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -51,6 +53,7 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
 
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
         : EmitX64(code), conf(conf), jit_interface{jit_interface} {
+    atomic_patch_sites = conf.shared_translations;
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
@@ -58,6 +61,10 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     ClearFastDispatchTable();
 
     exception_handler.SetFastmemCallback([this](u64 rip_) {
+        std::unique_lock lock{shared_mutex, std::defer_lock};
+        if (this->conf.shared_translations) {
+            lock.lock();
+        }
         return FastmemCallback(rip_);
     });
 }
@@ -154,6 +161,7 @@ void A64EmitX64::ClearCache() {
     block_ranges.ClearCache();
     ClearFastDispatchTable();
     fastmem_patch_info.clear();
+    unlinked_heads.clear();
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
@@ -211,6 +219,24 @@ void A64EmitX64::GenTerminalHandlers() {
         }
         code.and_(ebp, fast_dispatch_table_mask);
         code.lea(rbp, ptr[r12 + rbp]);
+        if (conf.shared_translations) {
+            // Entries are read and written as one aligned 16-byte access (atomic on AVX-capable x86): another
+            // thread may be replacing the entry. xmm0/xmm1 are dead between blocks.
+            Xbyak::Label shared_miss;
+            code.movdqa(xmm0, xword[rbp]);
+            code.movq(rax, xmm0);
+            code.cmp(rbx, rax);
+            code.jne(shared_miss);
+            code.pextrq(rax, xmm0, 1);
+            code.jmp(rax);
+            code.L(shared_miss);
+            code.LookupBlock();
+            code.movq(xmm0, rbx);
+            code.movq(xmm1, rax);
+            code.punpcklqdq(xmm0, xmm1);
+            code.movdqa(xword[rbp], xmm0);
+            code.jmp(rax);
+        }
         code.cmp(rbx, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);
         code.jne(fast_dispatch_cache_miss);
         code.jmp(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
@@ -558,7 +584,10 @@ void A64EmitX64::EmitA64GetDCZID(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr();
-    if (conf.tpidr_el0) {
+    if (conf.shared_translations) {
+        code.mov(result, qword[r15 + offsetof(A64JitState, tpidr_el0_ptr)]);
+        code.mov(result, qword[result]);
+    } else if (conf.tpidr_el0) {
         code.mov(result, u64(conf.tpidr_el0));
         code.mov(result, qword[result]);
     } else {
@@ -569,7 +598,10 @@ void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64GetTPIDRRO(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr();
-    if (conf.tpidrro_el0) {
+    if (conf.shared_translations) {
+        code.mov(result, qword[r15 + offsetof(A64JitState, tpidrro_el0_ptr)]);
+        code.mov(result, qword[result]);
+    } else if (conf.tpidrro_el0) {
         code.mov(result, u64(conf.tpidrro_el0));
         code.mov(result, qword[result]);
     } else {
@@ -582,7 +614,10 @@ void A64EmitX64::EmitA64SetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(args[0]);
     const Xbyak::Reg64 addr = ctx.reg_alloc.ScratchGpr();
-    if (conf.tpidr_el0) {
+    if (conf.shared_translations) {
+        code.mov(addr, qword[r15 + offsetof(A64JitState, tpidr_el0_ptr)]);
+        code.mov(qword[addr], value);
+    } else if (conf.tpidr_el0) {
         code.mov(addr, u64(conf.tpidr_el0));
         code.mov(qword[addr], value);
     }
@@ -620,6 +655,9 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
     if (conf.enable_cycle_counting) {
         code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
 
+        if (conf.shared_translations) {
+            code.align(8);
+        }
         patch_information[terminal.next].jg.push_back(code.getCurr());
         if (const auto next_bb = GetBasicBlock(terminal.next)) {
             EmitPatchJg(terminal.next, next_bb->entrypoint);
@@ -629,6 +667,9 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
     } else {
         code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
 
+        if (conf.shared_translations) {
+            code.align(8);
+        }
         patch_information[terminal.next].jz.push_back(code.getCurr());
         if (const auto next_bb = GetBasicBlock(terminal.next)) {
             EmitPatchJz(terminal.next, next_bb->entrypoint);
@@ -650,6 +691,9 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
         return;
     }
 
+    if (conf.shared_translations) {
+        code.align(8);
+    }
     patch_information[terminal.next].jmp.push_back(code.getCurr());
     if (auto next_bb = GetBasicBlock(terminal.next)) {
         EmitPatchJmp(terminal.next, next_bb->entrypoint);
@@ -706,7 +750,69 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::CheckHalt terminal, IR::LocationDesc
     EmitTerminal(terminal.else_, initial_location, is_single_step);
 }
 
+// x86Code shared translations. A jg/jz/jmp site always holds its unlinked form (mov rax, pc; mov [r15+pc], rax;
+// jcc/jmp dispatcher; 23/22 bytes) and starts 8-byte aligned. Linking replaces only the first 8 bytes, atomically:
+// `jcc rel32; jmp short <site end>` or `jmp rel32`. A thread inside the site sees either head, and the tail it may
+// be executing never changes. kind: 0 jg, 1 jz, 2 jmp.
+void A64EmitX64::WriteSharedLinkHead(int kind, CodePtr site, CodePtr target_code_ptr) {
+    const u64 site_addr = reinterpret_cast<u64>(site);
+    ASSERT((site_addr & 7) == 0);
+    u64 head;
+    if (!target_code_ptr) {
+        head = unlinked_heads.at(site_addr);
+    } else {
+        u8 bytes[8];
+        std::memcpy(bytes, site, 8);
+        const size_t insn_len = kind == 2 ? 5 : 6;
+        const s64 rel = static_cast<s64>(reinterpret_cast<u64>(target_code_ptr)) - static_cast<s64>(site_addr + insn_len);
+        ASSERT(rel == static_cast<s32>(rel));
+        const s32 rel32 = static_cast<s32>(rel);
+        if (kind == 2) {
+            bytes[0] = 0xE9;
+            std::memcpy(bytes + 1, &rel32, 4);
+        } else {
+            bytes[0] = 0x0F;
+            bytes[1] = kind == 0 ? 0x8F : 0x84;
+            std::memcpy(bytes + 2, &rel32, 4);
+            bytes[6] = 0xEB;  // jmp short over the unlinked tail to the end of the site
+            bytes[7] = 23 - 8;
+        }
+        std::memcpy(&head, bytes, 8);
+    }
+    __atomic_store_n(reinterpret_cast<u64*>(site_addr), head, __ATOMIC_RELEASE);
+}
+
+void A64EmitX64::EmitSharedPatchSite(int kind, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    const CodePtr site = code.getCurr();
+    if (patching) {
+        WriteSharedLinkHead(kind, site, target_code_ptr);
+        return;
+    }
+    // always the 10-byte `mov rax, imm64` (48 B8 imm64): no instruction may start inside the 8-byte head
+    code.db(0x48);
+    code.db(0xB8);
+    code.dq(A64::LocationDescriptor{target_desc}.PC());
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    if (kind == 0) {
+        code.jg(code.GetReturnFromRunCodeAddress());
+    } else if (kind == 1) {
+        code.jz(code.GetReturnFromRunCodeAddress());
+    } else {
+        code.jmp(code.GetReturnFromRunCodeAddress());
+    }
+    code.EnsurePatchLocationSize(site, kind == 2 ? 22 : 23);
+    u64 head;
+    std::memcpy(&head, site, 8);
+    unlinked_heads[reinterpret_cast<u64>(site)] = head;
+    if (target_code_ptr) {
+        WriteSharedLinkHead(kind, site, target_code_ptr);
+    }
+}
+
 void A64EmitX64::EmitPatchJg(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    if (conf.shared_translations) {
+        return EmitSharedPatchSite(0, target_desc, target_code_ptr);
+    }
     const CodePtr patch_location = code.getCurr();
     if (target_code_ptr) {
         code.jg(target_code_ptr);
@@ -719,6 +825,9 @@ void A64EmitX64::EmitPatchJg(const IR::LocationDescriptor& target_desc, CodePtr 
 }
 
 void A64EmitX64::EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    if (conf.shared_translations) {
+        return EmitSharedPatchSite(1, target_desc, target_code_ptr);
+    }
     const CodePtr patch_location = code.getCurr();
     if (target_code_ptr) {
         code.jz(target_code_ptr);
@@ -731,6 +840,9 @@ void A64EmitX64::EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr 
 }
 
 void A64EmitX64::EmitPatchJmp(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    if (conf.shared_translations) {
+        return EmitSharedPatchSite(2, target_desc, target_code_ptr);
+    }
     const CodePtr patch_location = code.getCurr();
     if (target_code_ptr) {
         code.jmp(target_code_ptr);
@@ -747,15 +859,26 @@ void A64EmitX64::EmitPatchMovRcx(CodePtr target_code_ptr) {
         target_code_ptr = code.GetReturnFromRunCodeAddress();
     }
     const CodePtr patch_location = code.getCurr();
+    if (conf.shared_translations && patching) {
+        // the imm64 is 8-byte aligned (PushRSBHelper): one atomic store
+        __atomic_store_n(reinterpret_cast<u64*>(reinterpret_cast<u64>(patch_location) + 2), reinterpret_cast<u64>(target_code_ptr), __ATOMIC_RELEASE);
+        return;
+    }
     code.mov(code.rcx, reinterpret_cast<u64>(target_code_ptr));
     code.EnsurePatchLocationSize(patch_location, 10);
+    ASSERT(!conf.shared_translations || (code.getCurr<const u8*>() - static_cast<const u8*>(patch_location) == 10 && ((reinterpret_cast<u64>(patch_location) + 2) & 7) == 0));
 }
 
 void A64EmitX64::Unpatch(const IR::LocationDescriptor& location) {
     EmitX64::Unpatch(location);
     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
         code.DisableWriting();
-        (*fast_dispatch_table_lookup)(location.Value()) = {};
+        auto& entry = (*fast_dispatch_table_lookup)(location.Value());
+        if (conf.shared_translations) {
+            _mm_store_si128(reinterpret_cast<__m128i*>(&entry), _mm_set_epi64x(0, -1));
+        } else {
+            entry = {};
+        }
         code.EnableWriting();
     }
 }
