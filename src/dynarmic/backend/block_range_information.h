@@ -5,10 +5,10 @@
 
 #pragma once
 
-#include <set>
+#include <vector>
 
-#include <boost/icl/interval_map.hpp>
 #include <boost/icl/interval_set.hpp>
+#include <tsl/robin_map.h>
 #include <tsl/robin_set.h>
 
 #include "dynarmic/ir/location_descriptor.h"
@@ -23,7 +23,13 @@ public:
     tsl::robin_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges);
 
 private:
-    boost::icl::interval_map<ProgramCounterType, std::set<IR::LocationDescriptor>> block_ranges;
+    static constexpr ProgramCounterType kPageShift = 12;
+    static constexpr ProgramCounterType PageOf(ProgramCounterType addr) { return addr >> kPageShift; }
+
+    // page index -> blocks that touch that page
+    tsl::robin_map<ProgramCounterType, tsl::robin_set<IR::LocationDescriptor>> page_blocks;
+    // block -> pages it was registered on (for O(pages_per_block) erase)
+    tsl::robin_map<IR::LocationDescriptor, std::vector<ProgramCounterType>> block_pages;
 };
 
 }  // namespace Dynarmic::Backend
