@@ -201,7 +201,11 @@ template<>
 
 template<std::size_t bitsize>
 const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
-    if (ordered) {
+    // x86Code: ordered (acquire) reads up to 64 bits are plain loads. x86 loads already have acquire semantics, and
+    // ordered writes are xchg (a full barrier), so STLR -> LDAR stays ordered. The locked "xadd 0" this used to be is
+    // a write cycle: LDAR/LDAPR on read-only pages (constant CFStrings and objc data in __DATA_CONST) faulted and went
+    // through the fastmem fallback once per location.
+    if (ordered && bitsize == 128) {
         if constexpr (bitsize != 128) {
             code.xor_(Xbyak::Reg32{value_idx}, Xbyak::Reg32{value_idx});
         } else {
