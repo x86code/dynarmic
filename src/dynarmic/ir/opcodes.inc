@@ -757,6 +757,11 @@ A64OPC(ExclusiveWriteMemory16,                              U32,            U64,
 A64OPC(ExclusiveWriteMemory32,                              U32,            U64,            U64,            U32,            AccType         )
 A64OPC(ExclusiveWriteMemory64,                              U32,            U64,            U64,            U64,            AccType         )
 A64OPC(ExclusiveWriteMemory128,                             U32,            U64,            U64,            U128,           AccType         )
+// LSE atomics (designgears): (vaddr, operand, op<<4|log2size) -> old value zero-extended
+A64OPC(AtomicRMW,                                           U64,            U64,            U64,            U8                              )
+// (vaddr, expected, desired, log2size) -> old value zero-extended
+A64OPC(AtomicCAS,                                           U64,            U64,            U64,            U64,            U8              )
+A64OPC(AtomicCAS128,                                        U128,           U64,            U128,           U128                            )
 
 // Coprocessor
 A32OPC(CoprocInternalOperation,                             Void,           CoprocInfo                                                      )

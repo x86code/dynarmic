@@ -76,6 +76,9 @@ public:
     IR::U32 ExclusiveWriteMemory32(const IR::U64& vaddr, const IR::U32& value, IR::AccType acc_type);
     IR::U32 ExclusiveWriteMemory64(const IR::U64& vaddr, const IR::U64& value, IR::AccType acc_type);
     IR::U32 ExclusiveWriteMemory128(const IR::U64& vaddr, const IR::U128& value, IR::AccType acc_type);
+    IR::U64 AtomicRMW(const IR::U64& vaddr, const IR::U64& operand, u8 op, size_t log2size);
+    IR::U64 AtomicCAS(const IR::U64& vaddr, const IR::U64& expected, const IR::U64& desired, size_t log2size);
+    IR::U128 AtomicCAS128(const IR::U64& vaddr, const IR::U128& expected, const IR::U128& desired);
 
     IR::U32 GetW(Reg source_reg);
     IR::U64 GetX(Reg source_reg);

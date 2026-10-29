@@ -182,6 +182,18 @@ IR::U32 IREmitter::ExclusiveWriteMemory128(const IR::U64& vaddr, const IR::U128&
     return Inst<IR::U32>(Opcode::A64ExclusiveWriteMemory128, ImmCurrentLocationDescriptor(), vaddr, value, IR::Value{acc_type});
 }
 
+IR::U64 IREmitter::AtomicRMW(const IR::U64& vaddr, const IR::U64& operand, u8 op, size_t log2size) {
+    return Inst<IR::U64>(Opcode::A64AtomicRMW, vaddr, operand, Imm8(static_cast<u8>((op << 4) | log2size)));
+}
+
+IR::U64 IREmitter::AtomicCAS(const IR::U64& vaddr, const IR::U64& expected, const IR::U64& desired, size_t log2size) {
+    return Inst<IR::U64>(Opcode::A64AtomicCAS, vaddr, expected, desired, Imm8(static_cast<u8>(log2size)));
+}
+
+IR::U128 IREmitter::AtomicCAS128(const IR::U64& vaddr, const IR::U128& expected, const IR::U128& desired) {
+    return Inst<IR::U128>(Opcode::A64AtomicCAS128, vaddr, expected, desired);
+}
+
 IR::U32 IREmitter::GetW(Reg reg) {
     if (reg == Reg::ZR)
         return Imm32(0);
