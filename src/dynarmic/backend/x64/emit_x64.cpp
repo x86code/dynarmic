@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <sys/mman.h>
 #include "dynarmic/backend/x64/emit_x64.h"
 
 #include <iterator>
@@ -46,6 +47,84 @@ EmitX64::EmitX64(BlockOfCode& code)
 }
 
 EmitX64::~EmitX64() = default;
+
+EmitX64::LockFreeBlockMap::Table* EmitX64::LockFreeBlockMap::Alloc(size_t n) {
+    void* p = mmap(nullptr, 16 + n * sizeof(Entry), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    ASSERT(p != MAP_FAILED);
+    Table* t = static_cast<Table*>(p);  // zero pages == empty entries
+    t->mask = n - 1;
+    return t;
+}
+
+EmitX64::LockFreeBlockMap::LockFreeBlockMap() {
+    table.store(Alloc(size_t{1} << 14), std::memory_order_release);
+}
+
+EmitX64::LockFreeBlockMap::~LockFreeBlockMap() {
+    Table* t = table.load();
+    munmap(t, 16 + (t->mask + 1) * sizeof(Entry));
+}
+
+void EmitX64::LockFreeBlockMap::Insert(Table* t, u64 k, CodePtr c) {
+    for (size_t i = Hash(k) & t->mask;; i = (i + 1) & t->mask) {
+        const u64 e = t->e[i].key.load(std::memory_order_relaxed);
+        if (e == k) {
+            t->e[i].code.store(c, std::memory_order_release);
+            return;
+        }
+        if (e == 0) {
+            t->e[i].code.store(c, std::memory_order_relaxed);
+            t->e[i].key.store(k, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+void EmitX64::LockFreeBlockMap::Set(u64 k, CodePtr c) {
+    if (!k) return;
+    Table* t = table.load(std::memory_order_relaxed);
+    if (!c) {
+        // Removal: clear the code pointer, keep the key (probe chains of concurrent readers stay intact).
+        for (size_t i = Hash(k) & t->mask;; i = (i + 1) & t->mask) {
+            const u64 e = t->e[i].key.load(std::memory_order_relaxed);
+            if (e == k) t->e[i].code.store(nullptr, std::memory_order_release);
+            if (e == k || e == 0) return;
+        }
+    }
+    if ((used + 1) * 2 > t->mask + 1) {
+        const size_t n = (t->mask + 1) * 2;
+        Table* nt = Alloc(n);
+        used = 0;
+        for (size_t i = 0; i <= t->mask; i++) {
+            const u64 e = t->e[i].key.load(std::memory_order_relaxed);
+            CodePtr ec = t->e[i].code.load(std::memory_order_relaxed);
+            if (e && ec) {
+                Insert(nt, e, ec);
+                used++;
+            }
+        }
+        table.store(nt, std::memory_order_release);
+        // Readers still in t see zeros (miss) from here on; the mapping is never unmapped.
+        madvise(t, 16 + (t->mask + 1) * sizeof(Entry), MADV_DONTNEED);
+        t = nt;
+    }
+    for (size_t i = Hash(k) & t->mask;; i = (i + 1) & t->mask) {
+        const u64 e = t->e[i].key.load(std::memory_order_relaxed);
+        if (e == k) break;
+        if (e == 0) {
+            used++;
+            break;
+        }
+    }
+    Insert(t, k, c);
+}
+
+void EmitX64::LockFreeBlockMap::Clear() {
+    Table* t = table.load(std::memory_order_relaxed);
+    for (size_t i = 0; i <= t->mask; i++) {
+        if (t->e[i].key.load(std::memory_order_relaxed)) t->e[i].code.store(nullptr, std::memory_order_release);
+    }
+}
 
 std::optional<EmitX64::BlockDescriptor> EmitX64::GetBasicBlock(IR::LocationDescriptor descriptor) const {
     const auto iter = block_descriptors.find(descriptor);
@@ -347,6 +426,7 @@ EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& de
 
     BlockDescriptor block_desc{entrypoint, size};
     block_descriptors.insert({IR::LocationDescriptor{descriptor.Value()}, block_desc});
+    lf_map.Set(descriptor.Value(), entrypoint);
     return block_desc;
 }
 
@@ -396,6 +476,7 @@ void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
 
 void EmitX64::ClearCache() {
     block_descriptors.clear();
+    lf_map.Clear();
     patch_information.clear();
 
     PerfMapClear();
@@ -415,6 +496,7 @@ void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>
 
         Unpatch(descriptor);
 
+        lf_map.Set(descriptor.Value(), nullptr);
         block_descriptors.erase(it);
     }
 }

@@ -899,7 +899,9 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         }
         CodePtr ep = begin + off;
         BlockDescriptor bd{ep, static_cast<size_t>(sz)};
-        block_descriptors.insert({IR::LocationDescriptor{desc_v}, bd});
+        if (block_descriptors.insert({IR::LocationDescriptor{desc_v}, bd}).second) {
+            lf_map.Set(desc_v, ep);
+        }
         const auto range = boost::icl::discrete_interval<u64>::closed(pc, pc + 3);
         block_ranges.AddRange(range, desc);
         persistable_blocks.push_back({desc_v, ep, static_cast<size_t>(sz)});

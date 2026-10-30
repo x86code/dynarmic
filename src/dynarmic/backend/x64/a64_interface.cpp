@@ -373,6 +373,11 @@ private:
         // other threads can still LookupBlock/Emit. A concurrent Invalidate bumps invalidate_gen; if it
         // changed while we translated, discard the IR and retry (the map may already have a fresh block).
         std::unique_lock lock{shared->mutex(), std::defer_lock};
+        if (conf.shared_translations) {
+            if (const CodePtr ep = emitter.LookupEntrypoint(current_location)) {
+                return ep;
+            }
+        }
         for (;;) {
             if (conf.shared_translations) {
                 lock.lock();

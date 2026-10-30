@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -84,6 +85,10 @@ public:
     /// Looks up an emitted host block in the cache.
     std::optional<BlockDescriptor> GetBasicBlock(IR::LocationDescriptor descriptor) const;
 
+    /// x86Code: lock-free GetBasicBlock for the dispatcher hit path (shared translations: GetBasicBlock needs the
+    /// shared mutex, this does not). nullptr = not known here; the caller falls back to the locked path.
+    CodePtr LookupEntrypoint(IR::LocationDescriptor descriptor) const { return lf_map.Lookup(descriptor.Value()); }
+
     /// Empties the entire cache.
     virtual void ClearCache();
 
@@ -144,6 +149,39 @@ protected:
     BlockOfCode& code;
     ExceptionHandler exception_handler;
     tsl::robin_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
+    // x86Code: insert-only open-addressing mirror of block_descriptors (key -> entrypoint), written under the shared
+    // mutex (single writer), read without it. Removal clears the code pointer and keeps the key, so probe chains stay
+    // intact. A reader may get an entrypoint that is invalidated right after; the locked path had the same window.
+    struct LockFreeBlockMap {
+        struct Entry {
+            std::atomic<u64> key{0};
+            std::atomic<CodePtr> code{nullptr};
+        };
+        struct Table {
+            u64 mask;
+            u64 pad;
+            Entry e[1];
+        };
+        // Grows by doubling at 50% load; the old table is published away, then zeroed with MADV_DONTNEED (kept
+        // mapped), so a reader still probing it sees empty keys = miss.
+        std::atomic<Table*> table{nullptr};
+        size_t used = 0;
+        LockFreeBlockMap();
+        ~LockFreeBlockMap();
+        static size_t Hash(u64 k) { return (k * 0x9E3779B97F4A7C15ull) >> 24; }
+        CodePtr Lookup(u64 k) const {
+            const Table* t = table.load(std::memory_order_acquire);
+            for (size_t i = Hash(k) & t->mask;; i = (i + 1) & t->mask) {
+                const u64 e = t->e[i].key.load(std::memory_order_acquire);
+                if (e == k) return k ? t->e[i].code.load(std::memory_order_acquire) : nullptr;
+                if (e == 0) return nullptr;
+            }
+        }
+        void Set(u64 k, CodePtr c);
+        void Clear();
+        static Table* Alloc(size_t n);
+        static void Insert(Table* t, u64 k, CodePtr c);
+    } lf_map;
     tsl::robin_map<IR::LocationDescriptor, PatchInformation> patch_information;
 };
 
