@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <sys/mman.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/personality.h>
@@ -711,6 +712,12 @@ std::vector<u64> A64EmitX64::ReadPersistentDescriptors(const std::string& path, 
 
 size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                        u64 cache_lo, u64 cache_hi, bool shared_image) {
+    int lock_fd = -1;
+    SCOPE_EXIT {
+        if (lock_fd >= 0) {
+            close(lock_fd);  // releases the flock
+        }
+    };
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) {
         return 0;
@@ -871,6 +878,12 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         char hex[24];
         std::snprintf(hex, sizeof hex, ".%016llx.map", static_cast<unsigned long long>(h));
         map_path = path + hex;
+        // Speed 7: one process at a time builds and publishes the .map/.idx; the others wait here and map them
+        // (with every daemon on the image, ~25 processes start together and each built a private copy).
+        lock_fd = open((map_path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (lock_fd >= 0) {
+            flock(lock_fd, LOCK_EX);
+        }
         const int mfd = open(map_path.c_str(), O_RDONLY | O_CLOEXEC);
         struct stat mst {};
         if (mfd >= 0 && fstat(mfd, &mst) == 0 && static_cast<u64>(mst.st_size) == end_u64 - floor_u) {
@@ -1231,9 +1244,10 @@ void A64EmitX64::PublishStaticIndex(const std::string& idx_path, std::vector<Fas
         static_image.map_len = len;
         static_image.blocks = reinterpret_cast<const StaticImage::Block*>(mb + o_blocks);
         static_image.links = reinterpret_cast<const StaticImage::Link*>(mb + o_links);
-        static_image.own_blocks = {};
-        static_image.own_links = {};
-        static_fm_own = {};
+        // (x = {} keeps the capacity)
+        std::vector<StaticImage::Block>().swap(static_image.own_blocks);
+        std::vector<StaticImage::Link>().swap(static_image.own_links);
+        std::vector<FastmemTable::StaticEntry>().swap(static_fm_own);
         fastmem_patch_info.SetStatic(reinterpret_cast<u64>(begin), reinterpret_cast<const FastmemTable::StaticEntry*>(mb + o_fm), fm.size(), std::move(cbs));
     } else {
         static_fm_own = std::move(fm);
