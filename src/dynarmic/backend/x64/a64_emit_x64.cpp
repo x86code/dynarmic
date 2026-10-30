@@ -722,6 +722,70 @@ std::vector<u64> A64EmitX64::ReadPersistentDescriptors(const std::string& path, 
     return out;
 }
 
+namespace {
+// x86Code Speed 9: the prelude (dispatcher, terminal handlers, ~7,700 fastmem fallback thunks: ~3.8 MB, ~1.8 MB of it
+// written) is byte-identical in every process with the same layout, yet each kept a private copy (~46 MB over one sim's
+// ~26 image processes). Content-addressed <aot>.prelude.<hash>: the first process publishes its bytes, the others map
+// the file MAP_PRIVATE over their identical copy (a page written later becomes private again). Layout differences (the
+// FastDispatch mask of apps vs daemons, a table that missed its fixed address) just give another file or no sharing.
+// X86CODE_A64_PRELUDE_SHARE=0 turns it off.
+void SharePrelude(const std::string& aot_path, u64 lo, u64 hi) {
+    if (hi <= lo || (std::getenv("X86CODE_A64_PRELUDE_SHARE") && std::atoi(std::getenv("X86CODE_A64_PRELUDE_SHARE")) == 0)) {
+        return;
+    }
+    const u64 len = hi - lo;
+    const u8* const p = reinterpret_cast<const u8*>(lo);
+    u64 h = 0xcbf29ce484222325ull;
+    for (u64 i = 0; i + 8 <= len; i += 8) {
+        u64 w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001b3ull;
+    }
+    char hex[40];
+    std::snprintf(hex, sizeof hex, ".prelude.%016llx", static_cast<unsigned long long>(h));
+    const std::string file = aot_path + hex;
+    int fd = open(file.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        const std::string tmp = file + ".tmp." + std::to_string(getpid());
+        const int w = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (w < 0) {
+            return;
+        }
+        u64 done = 0;
+        while (done < len) {
+            const ssize_t n = write(w, p + done, len - done);
+            if (n <= 0) {
+                break;
+            }
+            done += static_cast<u64>(n);
+        }
+        close(w);
+        if (done != len || (link(tmp.c_str(), file.c_str()) != 0 && errno != EEXIST)) {
+            unlink(tmp.c_str());
+            return;
+        }
+        unlink(tmp.c_str());
+        fd = open(file.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return;
+        }
+    }
+    struct stat st {};
+    bool same = fstat(fd, &st) == 0 && static_cast<u64>(st.st_size) == len;
+    if (same) {
+        void* chk = mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
+        same = chk != MAP_FAILED && std::memcmp(chk, p, len) == 0;
+        if (chk != MAP_FAILED) {
+            munmap(chk, len);
+        }
+    }
+    if (same) {
+        mmap(reinterpret_cast<void*>(lo), len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, fd, 0);
+    }
+    close(fd);
+}
+}  // namespace
+
 size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                        u64 cache_lo, u64 cache_hi, bool shared_image) {
     int lock_fd = -1;
@@ -1173,6 +1237,9 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         PublishStaticIndex(map_path + ".idx", std::move(static_fm), std::move(static_cbs));
     }
     ClearFastDispatchTable();
+    if (!map_path.empty()) {
+        SharePrelude(path, reinterpret_cast<u64>(code.getCode()), floor_u);
+    }
     return loaded;
 }
 
