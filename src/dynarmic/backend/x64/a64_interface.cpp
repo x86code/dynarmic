@@ -129,6 +129,10 @@ public:
 
     ~Impl() = default;
 
+    void Pretranslate(u64 location_descriptor) {
+        GetBlock(IR::LocationDescriptor{location_descriptor});
+    }
+
     HaltReason Run() {
         // x86code: Run may be re-entered from a callback (a native function calling back into guest code on the same
         // thread). The caller saves and restores the guest state around the nested run. Code may only be freed at the
@@ -136,6 +140,15 @@ public:
         const bool nested = run_depth > 0;
         if (!nested) {
             PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
+        }
+        // Shared IC invalidate unlinks blocks but does not touch per-thread RSB. Drop stale return
+        // predictions whenever we observe a newer invalidate_gen (monotonic, lock-free read).
+        if (conf.shared_translations && shared) {
+            const u64 gen = shared->invalidate_gen;
+            if (gen != rsb_invalidate_gen) {
+                rsb_invalidate_gen = gen;
+                jit_state.ResetRSB();
+            }
         }
 
         is_executing = true;
@@ -404,6 +417,7 @@ private:
             topts.define_unpredictable_behaviour = conf.define_unpredictable_behaviour;
             topts.wall_clock_cntpct = conf.wall_clock_cntpct;
             topts.memory_read_code = get_code;
+            topts.fuse_svc_ret = conf.fuse_svc_ret;
             IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code, topts);
             Optimization::PolyfillPass(ir_block, polyfill_options);
             Optimization::A64CallbackConfigPass(ir_block, conf);
@@ -481,6 +495,7 @@ private:
 
     bool is_executing = false;
     size_t run_depth = 0;
+    u64 rsb_invalidate_gen = 0;  // last shared->invalidate_gen we ResetRSB'd for
 
     std::shared_ptr<SharedCode> shared;
     const UserConfig& conf;
@@ -507,6 +522,15 @@ Jit::Jit(UserConfig conf, std::shared_ptr<SharedCode> shared)
         : impl(std::make_unique<Jit::Impl>(this, conf, std::move(shared))) {}
 
 Jit::~Jit() = default;
+
+void Jit::Pretranslate(std::uint64_t location_descriptor) {
+    impl->Pretranslate(location_descriptor);
+}
+
+std::vector<std::uint64_t> Jit::ReadPersistentDescriptors(const std::string& path, const std::uint8_t cache_uuid[16],
+                                                          std::uint64_t build_id) {
+    return A64EmitX64::ReadPersistentDescriptors(path, cache_uuid, build_id);
+}
 
 HaltReason Jit::Run() {
     return impl->Run();

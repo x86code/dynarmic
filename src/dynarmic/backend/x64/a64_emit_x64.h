@@ -58,6 +58,7 @@ public:
                                u64 cache_lo, u64 cache_hi);
     size_t LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                u64 cache_lo, u64 cache_hi);
+    static std::vector<u64> ReadPersistentDescriptors(const std::string& path, const u8 cache_uuid[16], u64 build_id);
 
     void ClearCache() override;
 

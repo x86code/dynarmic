@@ -587,6 +587,29 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
                                hdr.const_pool_used);
 }
 
+std::vector<u64> A64EmitX64::ReadPersistentDescriptors(const std::string& path, const u8 cache_uuid[16], u64 build_id) {
+    std::vector<u64> out;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        return out;
+    }
+    PersistHeader hdr{};
+    if (std::fread(&hdr, sizeof hdr, 1, f) == 1 && std::memcmp(hdr.magic, kPersistMagic, 8) == 0 &&
+        (build_id == 0 || hdr.build_id == build_id) && std::memcmp(hdr.uuid, cache_uuid, 16) == 0) {
+        out.reserve(hdr.n_blocks);
+        for (u64 i = 0; i < hdr.n_blocks; i++) {
+            u64 e[3];
+            if (std::fread(e, 8, 3, f) != 3) {
+                out.clear();
+                break;
+            }
+            out.push_back(e[0]);
+        }
+    }
+    std::fclose(f);
+    return out;
+}
+
 size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                        u64 cache_lo, u64 cache_hi) {
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -1193,27 +1216,13 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(args[0].IsImmediate());
     const u32 imm = args[0].GetImmediateU32();
-    // x86Code fuse_svc_ret: PC was set to svc+4 before this call (sentinel). Save it so we can
-    // tell a redirecting handler (SetPC) from a normal thunk that should return to X30.
-    if (conf.fuse_svc_ret) {
-        code.mov(code.rax, qword[r15 + offsetof(A64JitState, pc)]);
-        code.mov(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, fuse_svc_pc)], code.rax);
-    }
     Devirtualize<&A64::UserCallbacks::CallSVC>(conf.callbacks).EmitCall(code, [&](RegList param) {
         code.mov(param[0], imm);
     });
     // The kernel would have to execute ERET to get here, which would clear exclusive state.
     code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
-    if (conf.fuse_svc_ret) {
-        Xbyak::Label redirected;
-        code.mov(code.rax, qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, fuse_svc_pc)]);
-        code.cmp(qword[r15 + offsetof(A64JitState, pc)], code.rax);
-        code.jne(redirected);
-        // Normal thunk: return to caller (X30). Skips the separate "ret" block after svc.
-        code.mov(code.rax, qword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * 30]);
-        code.mov(qword[r15 + offsetof(A64JitState, pc)], code.rax);
-        code.L(redirected);
-    }
+    // x86Code: no PC=X30 rewrite here. The old one fired after every svc, including svcs not followed by a ret
+    // (it skipped their code); that broke boot. Optional skip-ret lives in GuestThread::CallSVC.
 }
 
 void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {

@@ -29,7 +29,8 @@ struct alignas(16) StackLayout {
     bool check_bit;
     u8 pad_check[3];
 
-    // x86Code: CallSVC fuse_svc_ret sentinel (PC after svc) saved across the host call.
+    // x86Code: reserved for an optional emitter-side fuse_svc_ret sentinel (unused: fuse
+    // lives in GuestThread::CallSVC). Kept so sizeof(StackLayout) stays 1056 (16-aligned).
     u64 fuse_svc_pc;
 };
 

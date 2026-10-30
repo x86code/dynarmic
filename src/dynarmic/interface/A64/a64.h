@@ -43,6 +43,13 @@ public:
     static std::size_t LoadPersistentCache(SharedCode& shared, const std::string& path,
                                            const std::uint8_t cache_uuid[16], std::uint64_t build_id,
                                            std::uint64_t cache_lo, std::uint64_t cache_hi);
+    /// x86Code: AOT. Location descriptors of the blocks in a saved cache (empty on mismatch or failure).
+    /// build_id 0 accepts any build (the hot set outlives codegen changes; only the image UUID must match).
+    static std::vector<std::uint64_t> ReadPersistentDescriptors(const std::string& path,
+                                                                const std::uint8_t cache_uuid[16],
+                                                                std::uint64_t build_id);
+    /// x86Code: AOT. Translate the block at a location descriptor without running it.
+    void Pretranslate(std::uint64_t location_descriptor);
     ~Jit();
 
     /**

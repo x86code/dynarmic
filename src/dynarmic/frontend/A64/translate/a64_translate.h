@@ -38,6 +38,12 @@ struct TranslationOptions {
 
     /// x86Code: optional reader so SVC can peek the next insn and fuse "svc; ret" thunks.
     MemoryReadCodeFuncType memory_read_code;
+
+    /// x86Code: when true (and memory_read_code peeks a following RET X30), SVC IR skips
+    /// PushRSB of svc+4, leaves PC at svc+4, and ends with FastDispatchHint. GuestThread::CallSVC
+    /// then sets PC=X30 when the handler did not redirect (skip the ret block). When false,
+    /// classic PushRSB → CallSVC → PopRSB → ret-block path.
+    bool fuse_svc_ret = false;
 };
 
 /**

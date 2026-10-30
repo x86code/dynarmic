@@ -295,9 +295,9 @@ struct UserConfig {
     /// while the process runs (invalidation only unlinks blocks). callbacks must not depend on which Jit runs.
     bool shared_translations = false;
 
-    /// x86Code: after CallSVC, if the handler left PC at the insn after SVC (svc; ret thunk), set PC to X30
-    /// and dispatch — skip the separate ret block. Handlers that SetPC keep their redirect.
-    bool fuse_svc_ret = false;  // x86Code: opt-in via X86CODE_A64_FUSE_SVC=1
+    /// x86Code: an "svc; ret" thunk block skips PushRSB and ends in FastDispatchHint (not PopRSBHint, which is
+    /// ReturnFromRunCode with RSB off), so the ret block runs without leaving Run(). Frontend only.
+    bool fuse_svc_ret = false;
 
     /// x86Code: when non-zero, the block at this guest PC is emitted as a hand-written x86 objc_msgSend
     /// cache probe (no A64 translate, no CallSVC). Hits FastDispatch to the IMP; misses go to uncached.
