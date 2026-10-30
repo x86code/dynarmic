@@ -90,6 +90,9 @@ public:
     /// x86Code: lock-free GetBasicBlock for the dispatcher hit path (shared translations: GetBasicBlock needs the
     /// shared mutex, this does not). nullptr = not known here; the caller falls back to the locked path.
     CodePtr LookupEntrypoint(IR::LocationDescriptor descriptor) const { return lf_map.Lookup(descriptor.Value()); }
+    /// x86Code debug (GETBLOCK_FD_VERIFY): descriptor whose block starts at ep (block_descriptors, then the static
+    /// image); 0 if none. Linear; call only on a mismatch, with the shared mutex held.
+    u64 OwnerOf(CodePtr ep) const;
 
     /// Empties the entire cache.
     virtual void ClearCache();

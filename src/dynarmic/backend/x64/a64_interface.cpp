@@ -3,10 +3,15 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
 #include <mutex>
+
+#include <unistd.h>
 
 #include <boost/icl/interval_set.hpp>
 #include <mcl/assert.hpp>
@@ -395,7 +400,33 @@ private:
         const bool fd = conf.shared_translations && fd_fill;
         if (fd) {
             if (const CodePtr ep = emitter.FastDispatchProbe(current_location.Value())) {
-                return ep;
+                if (!fd_verify) {
+                    return ep;
+                }
+                // X86CODE_A64_GETBLOCK_FD_VERIFY=1 (debug): check every probe hit against the map under the mutex.
+                lock.lock();
+                const auto block = emitter.GetBasicBlock(current_location);
+                const CodePtr want = block ? block->entrypoint : nullptr;
+                if (want != ep) {
+                    std::fprintf(stderr, "a64 getblock-fd: MISMATCH desc %#llx probe %p (owner %#llx) map %p (owner %#llx) gen %llu\n",
+                                 (unsigned long long)current_location.Value(), (const void*)ep, (unsigned long long)emitter.OwnerOf(ep),
+                                 (const void*)want, (unsigned long long)(want ? emitter.OwnerOf(want) : 0),
+                                 (unsigned long long)shared->invalidate_gen);
+                    const u32 end = fill_ring_pos.load();
+                    int shown = 0;
+                    for (u32 k = 0; k < kFillRing && shown < 4; k++) {
+                        const FillRec& f = fill_ring[(end - 1 - k) % kFillRing];
+                        if (f.desc == current_location.Value() || f.code == ep) {
+                            std::fprintf(stderr, "a64 getblock-fd:   fill#%u desc %#llx code %p path %u gen %u tid %d\n", end - 1 - k,
+                                         (unsigned long long)f.desc, f.code, f.path, f.gen, f.tid);
+                            shown++;
+                        }
+                    }
+                }
+                if (want) {
+                    return want;
+                }
+                lock.unlock();
             }
         }
         if (conf.shared_translations) {
@@ -403,6 +434,7 @@ private:
                 if (fd && lock.try_lock()) {
                     if (const CodePtr now = emitter.LookupEntrypoint(current_location)) {
                         emitter.FastDispatchFill(current_location.Value(), now);
+                        RecordFill(current_location.Value(), now, 1);
                     }
                 }
                 return ep;
@@ -416,6 +448,7 @@ private:
             if (auto block = emitter.GetBasicBlock(current_location)) {
                 if (fd) {
                     emitter.FastDispatchFill(current_location.Value(), block->entrypoint);
+                    RecordFill(current_location.Value(), block->entrypoint, 2);
                 }
                 return block->entrypoint;
             }
@@ -541,9 +574,25 @@ private:
     BlockOfCode& block_of_code;
     A64EmitX64& emitter;
     const Optimization::PolyfillOptions& polyfill_options;
-    // x86Code Speed 8: GetBlock probes/fills FastDispatch (X86CODE_A64_GETBLOCK_FD=1; off by default). Declared after
+    // x86Code Speed 8: GetBlock probes/fills FastDispatch (default on since Speed 9; X86CODE_A64_GETBLOCK_FD=0 off). Declared after
     // conf (it reads it).
     const bool fd_fill = conf.HasOptimization(OptimizationFlag::FastDispatch) && A64EmitX64::GetBlockFillsFastDispatch();
+    const bool fd_verify = std::getenv("X86CODE_A64_GETBLOCK_FD_VERIFY") != nullptr;
+    struct FillRec {
+        u64 desc;
+        const void* code;
+        u32 path, gen;
+        int tid;
+    };
+    static constexpr u32 kFillRing = 1u << 16;
+    static inline FillRec fill_ring[kFillRing];
+    static inline std::atomic<u32> fill_ring_pos{0};
+    void RecordFill(u64 desc, CodePtr code, u32 path) {
+        if (!fd_verify) {
+            return;
+        }
+        fill_ring[fill_ring_pos.fetch_add(1) % kFillRing] = {desc, code, path, static_cast<u32>(shared->invalidate_gen), static_cast<int>(gettid())};
+    }
 
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;

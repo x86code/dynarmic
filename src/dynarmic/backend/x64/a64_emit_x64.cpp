@@ -1333,23 +1333,38 @@ A64EmitX64::FastDispatchEntry* A64EmitX64::FastDispatchSlot(u64 location_descrip
 }
 
 bool A64EmitX64::GetBlockFillsFastDispatch() {
-    // Off by default: with it on, 2 of 4 cold boots crashed (iconservicesagent free() of a stack address, Preferences
-    // NULL+0x10 next to the Swift conformance step) even though every fill holds the shared mutex. Not yet understood.
-    static const bool on = std::getenv("X86CODE_A64_GETBLOCK_FD") && std::atoi(std::getenv("X86CODE_A64_GETBLOCK_FD")) == 1;
+    // Speed 9: on by default (X86CODE_A64_GETBLOCK_FD=0 turns it off). Speed 7/8's cold-boot crashes with it were the
+    // probe's torn 16-byte read (see FastDispatchLoad16). It changes the dispatcher's miss path (prelude size), so an
+    // AOT image only loads in processes with the same setting.
+    static const bool on = !(std::getenv("X86CODE_A64_GETBLOCK_FD") && std::atoi(std::getenv("X86CODE_A64_GETBLOCK_FD")) == 0);
     return on;
 }
 
+// x86Code Speed 9: one 16-byte access each, in asm. clang compiled _mm_load_si128 + the two extracts into two 8-byte
+// loads (key, then code): when another thread refilled the same slot in between, the probe matched location A's key
+// and returned block B's code (X86CODE_A64_GETBLOCK_FD_VERIFY found swapped pairs; the guest jumped into the heap or
+// got NULL back: the Speed 7/8 GetBlock probe crashes).
+static inline __m128i FastDispatchLoad16(const void* p) {
+    __m128i v;
+    asm volatile("movdqa %1, %0" : "=x"(v) : "m"(*static_cast<const __m128i*>(p)));
+    return v;
+}
+
+static inline void FastDispatchStore16(void* p, __m128i v) {
+    asm volatile("movdqa %1, %0" : "=m"(*static_cast<__m128i*>(p)) : "x"(v) : "memory");
+}
+
 CodePtr A64EmitX64::FastDispatchProbe(u64 location_descriptor) const {
-    const __m128i v = _mm_load_si128(reinterpret_cast<const __m128i*>(FastDispatchSlot(location_descriptor)));
+    const __m128i v = FastDispatchLoad16(FastDispatchSlot(location_descriptor));
     if (~static_cast<u64>(_mm_cvtsi128_si64(v)) != location_descriptor) {
         return nullptr;
     }
-    return reinterpret_cast<CodePtr>(_mm_extract_epi64(v, 1));
+    return reinterpret_cast<CodePtr>(_mm_cvtsi128_si64(_mm_unpackhi_epi64(v, v)));
 }
 
 void A64EmitX64::FastDispatchFill(u64 location_descriptor, CodePtr code_ptr) {
-    _mm_store_si128(reinterpret_cast<__m128i*>(FastDispatchSlot(location_descriptor)),
-                    _mm_set_epi64x(static_cast<s64>(reinterpret_cast<u64>(code_ptr)), static_cast<s64>(~location_descriptor)));
+    FastDispatchStore16(FastDispatchSlot(location_descriptor),
+                        _mm_set_epi64x(static_cast<s64>(reinterpret_cast<u64>(code_ptr)), static_cast<s64>(~location_descriptor)));
 }
 
 void A64EmitX64::ClearFastDispatchTable() {

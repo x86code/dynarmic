@@ -73,7 +73,7 @@ public:
     /// dispatcher would use) and fill (only with the shared mutex held).
     CodePtr FastDispatchProbe(u64 location_descriptor) const;
     void FastDispatchFill(u64 location_descriptor, CodePtr code_ptr);
-    /// X86CODE_A64_GETBLOCK_FD=1: GetBlock probes and fills (else the old way: the dispatcher's miss path fills).
+    /// Default on (Speed 9); X86CODE_A64_GETBLOCK_FD=0: the old way (the dispatcher's miss path fills).
     static bool GetBlockFillsFastDispatch();
 
     // x86Code: with shared_translations, guards the block map, patch/fastmem info and emission.

@@ -148,6 +148,22 @@ std::optional<EmitX64::BlockDescriptor> EmitX64::GetBasicBlock(IR::LocationDescr
     return std::nullopt;
 }
 
+u64 EmitX64::OwnerOf(CodePtr ep) const {
+    for (const auto& [desc, bd] : block_descriptors) {
+        if (bd.entrypoint == ep) {
+            return desc.Value();
+        }
+    }
+    if (static_image.active) {
+        for (size_t i = 0; i < static_image.n_blocks; i++) {
+            if (static_image.code_begin + static_image.blocks[i].off == ep) {
+                return static_image.blocks[i].desc | (static_image.Dead(i) ? (u64{1} << 63) : 0);
+            }
+        }
+    }
+    return 0;
+}
+
 size_t EmitX64::StaticImage::Index(u64 desc) const {
     const Block key{desc, 0, 0};
     const Block* it = std::lower_bound(blocks, blocks + n_blocks, key, BlockLess);
