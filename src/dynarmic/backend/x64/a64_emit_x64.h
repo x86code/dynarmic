@@ -57,8 +57,10 @@ public:
     /// x86Code: persistent translation cache (dyld shared-cache blocks without host calls).
     size_t SavePersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                u64 cache_lo, u64 cache_hi);
+    /// shared_image: map the code from a relocated, linked copy of the file (`<path>.<layout hash>.map`, written by the
+    /// first process with this layout when ASLR is off) so processes share its pages (Stage 4 step 2).
     size_t LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
-                               u64 cache_lo, u64 cache_hi);
+                               u64 cache_lo, u64 cache_hi, bool shared_image = false);
     static std::vector<u64> ReadPersistentDescriptors(const std::string& path, const u8 cache_uuid[16], u64 build_id);
 
     void ClearCache() override;
@@ -113,7 +115,17 @@ protected:
     // x86Code: 256K entries (4 MB); 64K thrashed with 175K-750K-block hot sets (SpringBoard startup: ~35% in GetBlock).
     static constexpr u64 fast_dispatch_table_mask = 0x3FFFF0;
     static constexpr size_t fast_dispatch_table_size = 0x40000;
-    alignas(16) std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;  // 16-byte atomic entries when shared
+    // x86Code: mapped right after the code cache (a fixed address relative to it, so code that embeds the table's
+    // address is identical in processes with the same code cache address: shared AOT image). 16-byte atomic entries.
+    struct FastDispatchStorage {
+        explicit FastDispatchStorage(BlockOfCode& code);
+        ~FastDispatchStorage();
+        FastDispatchEntry* data() const { return table; }
+        FastDispatchEntry* begin() const { return table; }
+        FastDispatchEntry* end() const { return table + fast_dispatch_table_size; }
+        void fill(const FastDispatchEntry& v) { std::fill(begin(), end(), v); }
+        FastDispatchEntry* table;
+    } fast_dispatch_table{code};
     // x86Code shared translations: original first 8 bytes of each unlinked jg/jz/jmp patch site
     void EmitSharedPatchSite(int kind, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
     void WriteSharedLinkHead(int kind, CodePtr site, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);

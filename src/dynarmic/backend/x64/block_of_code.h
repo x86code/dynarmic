@@ -35,6 +35,9 @@ struct RunCodeCallbacks {
     bool enable_cycle_counting;
 };
 
+/// x86Code: the next BlockOfCode is placed at this address when that range is free (shared AOT image).
+void SetNextCodeCacheAddress(u64 address);
+
 class BlockOfCode final : public Xbyak::CodeGenerator {
 public:
     BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp);

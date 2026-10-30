@@ -3,6 +3,12 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <cerrno>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/personality.h>
+#include <fcntl.h>
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include <immintrin.h>
 #include <algorithm>
@@ -58,6 +64,21 @@ bool A64EmitContext::IsSingleStep() const {
 
 FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
     return fpcr_controlled ? Location().FPCR() : Location().FPCR().ASIMDStandardValue();
+}
+
+A64EmitX64::FastDispatchStorage::FastDispatchStorage(BlockOfCode& code) {
+    constexpr size_t bytes = fast_dispatch_table_size * sizeof(FastDispatchEntry);
+    const u64 hint = (reinterpret_cast<u64>(code.getCode()) + code.GetTotalCodeSize() + 0x10000 + 0xFFFF) & ~u64(0xFFFF);
+    void* p = mmap(reinterpret_cast<void*>(hint), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p == MAP_FAILED) {
+        p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    ASSERT(p != MAP_FAILED);
+    table = static_cast<FastDispatchEntry*>(p);
+}
+
+A64EmitX64::FastDispatchStorage::~FastDispatchStorage() {
+    munmap(table, fast_dispatch_table_size * sizeof(FastDispatchEntry));
 }
 
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
@@ -670,7 +691,7 @@ std::vector<u64> A64EmitX64::ReadPersistentDescriptors(const std::string& path, 
 }
 
 size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
-                                       u64 cache_lo, u64 cache_hi) {
+                                       u64 cache_lo, u64 cache_hi, bool shared_image) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) {
         return 0;
@@ -790,8 +811,67 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         }
     }
 
+    // Stage 4 step 2: the code bytes after relocation, fastmem rebinding and linking depend only on this layout (the
+    // bases below, the prelude's fallback thunks, the file). Processes with the same layout (ASLR off, fixed code cache
+    // address) map one relocated copy MAP_PRIVATE: its pages stay shared until a process writes one (a later
+    // link/unlink or invalidation copies just that page).
+    const u64 page = 4096;
+    const u64 begin_u64 = reinterpret_cast<u64>(begin);
+    const u64 floor_u = begin_u64 & ~(page - 1);
+    const u64 ceil_u = (begin_u64 + page - 1) & ~(page - 1);
+    const u64 end_u64 = begin_u64 + hdr.code_size;
+    const u64 end_ceil = (end_u64 + page - 1) & ~(page - 1);
+    std::string map_path;
+    bool mapped = false;
+    if (shared_image && !std::getenv("X86CODE_A64_JITCACHE_NOLINK") && !std::getenv("X86CODE_A64_JITCACHE_SKIP_RANGE")) {
+        u64 h = 0xcbf29ce484222325ull;
+        const auto mix = [&h](u64 v) {
+            for (int i = 0; i < 8; i++) {
+                h = (h ^ ((v >> (8 * i)) & 0xff)) * 0x100000001b3ull;
+            }
+        };
+        struct stat st {};
+        if (fstat(fileno(f), &st) == 0) {
+            mix(static_cast<u64>(st.st_size));
+            mix(static_cast<u64>(st.st_mtim.tv_sec) * 1000000000ull + static_cast<u64>(st.st_mtim.tv_nsec));
+            mix(static_cast<u64>(st.st_ino));
+        }
+        for (u64 b : new_bases) {
+            mix(b);
+        }
+        mix(prelude_size);
+        mix(cache_lo);
+        mix(cache_hi);
+        for (const auto* m : {&read_fallbacks, &write_fallbacks, &exclusive_write_fallbacks}) {
+            u64 x = 0;
+            for (const auto& [k, fn] : *m) {
+                x += reinterpret_cast<u64>(fn) * 0x9E3779B97F4A7C15ull;
+            }
+            mix(x);
+        }
+        char hex[24];
+        std::snprintf(hex, sizeof hex, ".%016llx.map", static_cast<unsigned long long>(h));
+        map_path = path + hex;
+        const int mfd = open(map_path.c_str(), O_RDONLY | O_CLOEXEC);
+        struct stat mst {};
+        if (mfd >= 0 && fstat(mfd, &mst) == 0 && static_cast<u64>(mst.st_size) == end_u64 - floor_u) {
+            const u64 head = std::min(ceil_u, end_u64) - begin_u64;
+            bool ok = pread(mfd, begin, head, static_cast<off_t>(begin_u64 - floor_u)) == static_cast<ssize_t>(head);
+            if (ok && end_ceil > ceil_u) {
+                void* m = mmap(reinterpret_cast<void*>(ceil_u), end_ceil - ceil_u, PROT_READ | PROT_WRITE | PROT_EXEC,
+                               MAP_PRIVATE | MAP_FIXED, mfd, static_cast<off_t>(ceil_u - floor_u));
+                ok = m != MAP_FAILED;
+            }
+            mapped = ok;
+        }
+        if (mfd >= 0) {
+            close(mfd);
+        }
+    }
     code.EnableWriting();
-    if (std::fread(begin, 1, hdr.code_size, f) != hdr.code_size) {
+    if (mapped) {
+        std::fseek(f, static_cast<long>(hdr.code_size), SEEK_CUR);
+    } else if (std::fread(begin, 1, hdr.code_size, f) != hdr.code_size) {
         code.DisableWriting();
         std::fclose(f);
         return 0;
@@ -816,8 +896,8 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
                          static_cast<unsigned long long>(hdr.const_pool_used));
         }
     }
-    // Apply emitter-recorded relocations against the new bases.
-    for (const auto& r : relocs) {
+    // Apply emitter-recorded relocations against the new bases (already applied in a mapped copy).
+    for (const auto& r : (mapped ? std::vector<RelocEntry>{} : relocs)) {
         const size_t ki = static_cast<size_t>(r.kind);
         const u64 old_base = hdr.old_bases[ki];
         const u64 new_base = new_bases[ki];
@@ -865,8 +945,10 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
             if (call_site[0] == 0xE8) {
                 const u64 next = reinterpret_cast<u64>(call_site) + 5;
                 const s32 rel = static_cast<s32>(static_cast<s64>(reinterpret_cast<u64>(fn) - next));
-                std::memcpy(call_site + 1, &rel, sizeof(rel));
-                fm_call_patched++;
+                if (std::memcmp(call_site + 1, &rel, sizeof(rel)) != 0) {  // no write (page copy) when unchanged
+                    std::memcpy(call_site + 1, &rel, sizeof(rel));
+                    fm_call_patched++;
+                }
             }
         }
     }
@@ -931,7 +1013,54 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         code.DisableWriting();
     }
     if (std::getenv("X86CODE_A64_JITCACHE_DEBUG")) {
-        std::fprintf(stderr, "a64jitcache: %zu link sites, %zu target blocks linked\n", links.size(), linked);
+        std::fprintf(stderr, "a64jitcache: %zu link sites, %zu target blocks linked, %s, fm calls patched %zu\n", links.size(),
+                     linked, mapped ? "mapped" : "copied", fm_call_patched);
+    }
+    // First process with this layout: write the relocated, linked code for the next ones (ASLR off only; with ASLR
+    // every process has its own layout), then map it over our private copy so this process shares it too.
+    if (!mapped && !map_path.empty() && (personality(0xffffffff) & ADDR_NO_RANDOMIZE) && end_u64 > floor_u) {
+        const std::string tmp = map_path + ".tmp." + std::to_string(getpid());
+        const int wfd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (wfd >= 0) {
+            const u64 len = end_u64 - floor_u;
+            u64 done = 0;
+            while (done < len) {
+                const ssize_t n = write(wfd, reinterpret_cast<const u8*>(floor_u) + done, len - done);
+                if (n <= 0) {
+                    break;
+                }
+                done += static_cast<u64>(n);
+            }
+            close(wfd);
+            // link, not rename: when processes with this layout start together, the first file stays and every one
+            // maps it (a rename would leave the earlier ones on a deleted copy). The contents are identical.
+            const bool published = done == len && (link(tmp.c_str(), map_path.c_str()) == 0 || errno == EEXIST);
+            unlink(tmp.c_str());
+            if (published) {
+                const int mfd = open(map_path.c_str(), O_RDONLY | O_CLOEXEC);
+                struct stat mst {};
+                bool same = mfd >= 0 && end_ceil > ceil_u && fstat(mfd, &mst) == 0 && static_cast<u64>(mst.st_size) == len;
+                if (same) {
+                    // another process's file: it must hold exactly our bytes (the layout hash should guarantee it)
+                    void* chk = mmap(nullptr, len, PROT_READ, MAP_PRIVATE, mfd, 0);
+                    same = chk != MAP_FAILED && std::memcmp(static_cast<const u8*>(chk) + (begin_u64 - floor_u), begin, hdr.code_size) == 0;
+                    if (chk != MAP_FAILED) {
+                        munmap(chk, len);
+                    }
+                    if (!same) {
+                        std::fprintf(stderr, "a64jitcache: %s differs from this process's relocated code; not mapped\n", map_path.c_str());
+                    }
+                }
+                if (same) {
+                    // identical bytes: swapping the private pages for the file's is invisible to the code
+                    mmap(reinterpret_cast<void*>(ceil_u), end_ceil - ceil_u, PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_FIXED, mfd, static_cast<off_t>(ceil_u - floor_u));
+                }
+                if (mfd >= 0) {
+                    close(mfd);
+                }
+            }
+        }
     }
     ClearFastDispatchTable();
     return loaded;
@@ -1595,7 +1724,10 @@ void A64EmitX64::WriteSharedLinkHead(int kind, CodePtr site, const IR::LocationD
         }
         std::memcpy(&head, bytes, 8);
     }
-    __atomic_store_n(reinterpret_cast<u64*>(site_addr), head, __ATOMIC_RELEASE);
+    // no store when unchanged: a mapped AOT image page stays shared (relinking at load writes the same bytes)
+    if (__atomic_load_n(reinterpret_cast<const u64*>(site_addr), __ATOMIC_RELAXED) != head) {
+        __atomic_store_n(reinterpret_cast<u64*>(site_addr), head, __ATOMIC_RELEASE);
+    }
 }
 
 void A64EmitX64::EmitSharedPatchSite(int kind, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {

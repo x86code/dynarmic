@@ -19,6 +19,7 @@
 #endif
 
 #include <array>
+#include <atomic>
 #include <cstring>
 
 #include <mcl/assert.hpp>
@@ -51,6 +52,14 @@ const Xbyak::Reg64 BlockOfCode::ABI_PARAM5 = HostLocToReg64(Dynarmic::Backend::X
 const Xbyak::Reg64 BlockOfCode::ABI_PARAM6 = HostLocToReg64(Dynarmic::Backend::X64::ABI_PARAM6);
 const std::array<Xbyak::Reg64, ABI_PARAM_COUNT> BlockOfCode::ABI_PARAMS = {BlockOfCode::ABI_PARAM1, BlockOfCode::ABI_PARAM2, BlockOfCode::ABI_PARAM3, BlockOfCode::ABI_PARAM4, BlockOfCode::ABI_PARAM5, BlockOfCode::ABI_PARAM6};
 #endif
+
+namespace {
+std::atomic<u64> g_next_code_cache_address{0};
+}  // namespace
+
+void SetNextCodeCacheAddress(u64 address) {
+    g_next_code_cache_address = address;
+}
 
 namespace {
 
@@ -93,7 +102,15 @@ public:
         mode |= MAP_JIT;
 #    endif
 
-        void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, mode, -1, 0);
+        // x86Code: a one-shot fixed address (SetNextCodeCacheAddress) so translations are byte-identical across
+        // processes with the same layout (shared AOT image); falls back to anywhere when that range is taken.
+        void* p = MAP_FAILED;
+        if (const u64 hint = g_next_code_cache_address.exchange(0)) {
+            p = mmap(reinterpret_cast<void*>(hint - DYNARMIC_PAGE_SIZE), size, PROT_READ | PROT_WRITE, mode | MAP_FIXED_NOREPLACE, -1, 0);
+        }
+        if (p == MAP_FAILED) {
+            p = mmap(nullptr, size, PROT_READ | PROT_WRITE, mode, -1, 0);
+        }
         if (p == MAP_FAILED) {
             throw Xbyak::Error(Xbyak::ERR_CANT_ALLOC);
         }

@@ -84,6 +84,10 @@ Jit::SharedStats Jit::GetSharedStats(const SharedCode& shared) {
     return shared.stats;
 }
 
+void Jit::SetCodeCacheAddress(std::uint64_t address) {
+    Backend::X64::SetNextCodeCacheAddress(address);
+}
+
 std::string Jit::GetMemoryReport(SharedCode& shared) {
     std::unique_lock lock{shared.mutex()};
     return shared.emitter.MemoryReport();
@@ -102,9 +106,9 @@ std::size_t Jit::SavePersistentCache(SharedCode& shared, const std::string& path
 
 std::size_t Jit::LoadPersistentCache(SharedCode& shared, const std::string& path,
                                      const std::uint8_t cache_uuid[16], std::uint64_t build_id,
-                                     std::uint64_t cache_lo, std::uint64_t cache_hi) {
+                                     std::uint64_t cache_lo, std::uint64_t cache_hi, bool shared_image) {
     std::unique_lock lock{shared.mutex()};
-    const size_t n = shared.emitter.LoadPersistentCache(path, cache_uuid, build_id, cache_lo, cache_hi);
+    const size_t n = shared.emitter.LoadPersistentCache(path, cache_uuid, build_id, cache_lo, cache_hi, shared_image);
     if (n) {
         shared.stats.blocks += n;
     }
