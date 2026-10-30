@@ -37,6 +37,7 @@ struct RunCodeCallbacks {
 
 /// x86Code: the next BlockOfCode is placed at this address when that range is free (shared AOT image).
 void SetNextCodeCacheAddress(u64 address);
+void SetFastDispatchEntries(size_t n);  // x86Code: entries (power of two) of FastDispatch tables made after this
 
 class BlockOfCode final : public Xbyak::CodeGenerator {
 public:

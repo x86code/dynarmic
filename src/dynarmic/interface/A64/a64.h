@@ -47,6 +47,8 @@ public:
                                            std::uint64_t cache_lo, std::uint64_t cache_hi, bool shared_image = false);
     /// x86Code: place the next code cache at this address if free (shared AOT image: same layout in every process).
     static void SetCodeCacheAddress(std::uint64_t address);
+    /// x86Code: FastDispatch table entries (power of two, 4K-1M) for emitters created after this call.
+    static void SetFastDispatchEntries(std::size_t n);
     /// x86Code: AOT. Location descriptors of the blocks in a saved cache (empty on mismatch or failure).
     /// build_id 0 accepts any build (the hot set outlives codegen changes; only the image UUID must match).
     static std::vector<std::uint64_t> ReadPersistentDescriptors(const std::string& path,

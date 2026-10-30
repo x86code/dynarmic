@@ -68,8 +68,20 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
     return fpcr_controlled ? Location().FPCR() : Location().FPCR().ASIMDStandardValue();
 }
 
-A64EmitX64::FastDispatchStorage::FastDispatchStorage(BlockOfCode& code) {
-    constexpr size_t bytes = fast_dispatch_table_size * sizeof(FastDispatchEntry);
+static size_t g_fd_entries = 0x40000;
+
+void SetFastDispatchEntries(size_t n) {
+    if (n >= 0x1000 && n <= 0x100000 && (n & (n - 1)) == 0) {
+        g_fd_entries = n;
+    }
+}
+
+size_t A64EmitX64::NextFastDispatchEntries() {
+    return g_fd_entries;
+}
+
+A64EmitX64::FastDispatchStorage::FastDispatchStorage(BlockOfCode& code) : size(g_fd_entries) {
+    const size_t bytes = size * sizeof(FastDispatchEntry);
     const u64 hint = (reinterpret_cast<u64>(code.getCode()) + code.GetTotalCodeSize() + 0x10000 + 0xFFFF) & ~u64(0xFFFF);
     void* p = mmap(reinterpret_cast<void*>(hint), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (p == MAP_FAILED) {
@@ -80,7 +92,7 @@ A64EmitX64::FastDispatchStorage::FastDispatchStorage(BlockOfCode& code) {
 }
 
 A64EmitX64::FastDispatchStorage::~FastDispatchStorage() {
-    munmap(table, fast_dispatch_table_size * sizeof(FastDispatchEntry));
+    munmap(table, size * sizeof(FastDispatchEntry));
 }
 
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)

@@ -88,6 +88,10 @@ void Jit::SetCodeCacheAddress(std::uint64_t address) {
     Backend::X64::SetNextCodeCacheAddress(address);
 }
 
+void Jit::SetFastDispatchEntries(std::size_t n) {
+    Backend::X64::SetFastDispatchEntries(n);
+}
+
 std::string Jit::GetMemoryReport(SharedCode& shared) {
     std::unique_lock lock{shared.mutex()};
     return shared.emitter.MemoryReport();

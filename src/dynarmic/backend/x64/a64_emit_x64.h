@@ -113,8 +113,10 @@ protected:
     static_assert(sizeof(FastDispatchEntry) == 0x10);
     // x86Code: 64K entries (1 MB) instead of 1M (16 MB, all touched when cleared): there is one Jit per guest thread
     // x86Code: 256K entries (4 MB); 64K thrashed with 175K-750K-block hot sets (SpringBoard startup: ~35% in GetBlock).
-    static constexpr u64 fast_dispatch_table_mask = 0x3FFFF0;
-    static constexpr size_t fast_dispatch_table_size = 0x40000;
+    // x86Code Speed 7: set per process before the emitter exists (SetFastDispatchEntries): 64K for daemons.
+    const size_t fast_dispatch_table_size = NextFastDispatchEntries();
+    const u64 fast_dispatch_table_mask = (fast_dispatch_table_size - 1) << 4;
+    static size_t NextFastDispatchEntries();
     // x86Code: mapped right after the code cache (a fixed address relative to it, so code that embeds the table's
     // address is identical in processes with the same code cache address: shared AOT image). 16-byte atomic entries.
     struct FastDispatchStorage {
@@ -122,7 +124,8 @@ protected:
         ~FastDispatchStorage();
         FastDispatchEntry* data() const { return table; }
         FastDispatchEntry* begin() const { return table; }
-        FastDispatchEntry* end() const { return table + fast_dispatch_table_size; }
+        FastDispatchEntry* end() const { return table + size; }
+        size_t size;
         void fill(const FastDispatchEntry& v) { std::fill(begin(), end(), v); }
         FastDispatchEntry* table;
     } fast_dispatch_table{code};
