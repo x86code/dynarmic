@@ -35,6 +35,8 @@ struct A64EmitContext final : public EmitContext {
     }
 
     const A64::UserConfig& conf;
+    /// x86Code: set when the block emits a HostCall (CallSVC, etc.); those blocks are not persisted.
+    bool has_host_call = false;
 };
 
 class A64EmitX64 final : public EmitX64 {
@@ -48,12 +50,28 @@ public:
      */
     BlockDescriptor Emit(IR::Block& block);
 
+    /// x86Code: emit a hand-written x86 objc_msgSend cache probe for conf.inline_objc_*.
+    BlockDescriptor EmitInlineObjCMsgSend(IR::LocationDescriptor descriptor);
+
+    /// x86Code: persistent translation cache (dyld shared-cache blocks without host calls).
+    size_t SavePersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
+                               u64 cache_lo, u64 cache_hi);
+    size_t LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
+                               u64 cache_lo, u64 cache_hi);
+
     void ClearCache() override;
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
     // x86Code: with shared_translations, guards the block map, patch/fastmem info and emission.
     std::recursive_mutex shared_mutex;
+
+    struct PersistEntry {
+        u64 location_descriptor;
+        CodePtr entrypoint;
+        size_t size;
+    };
+    std::vector<PersistEntry> persistable_blocks;
 
 protected:
     const A64::UserConfig conf;

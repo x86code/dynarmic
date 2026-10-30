@@ -27,6 +27,10 @@ struct alignas(16) StackLayout {
     u32 save_host_MXCSR;
 
     bool check_bit;
+    u8 pad_check[3];
+
+    // x86Code: CallSVC fuse_svc_ret sentinel (PC after svc) saved across the host call.
+    u64 fuse_svc_pc;
 };
 
 #ifdef _MSC_VER

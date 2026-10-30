@@ -5,7 +5,10 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include <immintrin.h>
+#include <cstdio>
 #include <cstring>
+#include <tuple>
+#include <vector>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -153,7 +156,336 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     const auto range = boost::icl::discrete_interval<u64>::closed(descriptor.PC(), end_location.PC() - 1);
     block_ranges.AddRange(range, descriptor);
 
-    return RegisterBlock(descriptor, entrypoint, size);
+    auto bd = RegisterBlock(descriptor, entrypoint, size);
+    // Track persistable blocks (no host calls; PC filter applied at save time).
+    if (!ctx.has_host_call && !ctx.IsSingleStep()) {
+        persistable_blocks.push_back({descriptor.UniqueHash(), entrypoint, size});
+    }
+    return bd;
+}
+
+// x86Code: hand-written objc_msgSend cache probe matching iOS 27.0 sim libobjcMsgSend
+// (isa mask 0x7ffffffffffff8, cache at class+0x10, HIGH_16_BIG_ADDRS, bucket {imp^class, sel},
+// post-index ldp #-16). One x86 block; hit → FastDispatch to IMP; miss → uncached; nil → LR.
+A64EmitX64::BlockDescriptor A64EmitX64::EmitInlineObjCMsgSend(IR::LocationDescriptor location) {
+    ASSERT(conf.inline_objc_msgsend != 0);
+    ASSERT(conf.inline_objc_uncached != 0);
+
+    code.EnableWriting();
+    SCOPE_EXIT {
+        code.DisableWriting();
+    };
+
+    code.align();
+    const u8* const entrypoint = code.getCurr();
+
+    constexpr u64 kIsaMask = 0x7ffffffffffff8ull;
+    constexpr u64 kBucketsMask = 0xffffffffffffull;
+    constexpr u64 kTbi = 0x00ffffffffffffffull;
+    constexpr u64 kCacheOffset = 0x10;
+
+    const auto reg_off = [](size_t i) {
+        return offsetof(A64JitState, reg) + sizeof(u64) * i;
+    };
+    const auto vec_off = [](size_t i) {
+        // Each V register is 2×u64 in A64JitState::vec.
+        return offsetof(A64JitState, vec) + sizeof(u64) * 2 * i;
+    };
+
+    Xbyak::Label nil_path, tagged_path, miss_path, hit_path, wrap_setup, wrap_loop, probe_loop;
+    constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
+
+    // rax = obj (x0), rcx = sel (x1)
+    code.mov(rax, qword[r15 + reg_off(0)]);
+    code.mov(rcx, qword[r15 + reg_off(1)]);
+
+    code.test(rax, rax);
+    code.jz(nil_path, Near);
+    code.test(rax, rax);
+    code.js(tagged_path, Near);  // MSB set ⇒ tagged
+
+    // cls = *obj & isa_mask (TBI on the object pointer). Masks >32-bit need a register.
+    code.mov(rdx, rax);
+    code.mov(rbx, kTbi);
+    code.and_(rdx, rbx);
+    code.mov(rdx, qword[rdx]);  // raw isa
+    code.mov(rbx, kIsaMask);
+    code.and_(rdx, rbx);        // class
+    code.mov(qword[r15 + reg_off(15)], rdx);  // x15 = class
+    code.mov(qword[r15 + reg_off(16)], rdx);  // x16 = class
+
+    // cache = *(class+0x10); buckets = cache & mask48; mask = cache >> 48
+    code.mov(r8, qword[rdx + kCacheOffset]);
+    code.mov(r9, r8);
+    code.mov(rbx, kBucketsMask);
+    code.and_(r9, rbx);  // buckets
+    code.shr(r8, 48);    // mask in r8d
+
+    // idx = sel & mask; cur = buckets + idx*16; first = cur
+    code.mov(r10d, ecx);
+    code.and_(r10d, r8d);
+    code.shl(r10, 4);
+    code.add(r10, r9);  // cur
+    code.mov(r11, r10); // first
+
+    code.L(probe_loop);
+    code.mov(rax, qword[r10]);      // stored_imp
+    code.mov(rbx, qword[r10 + 8]);  // bsel
+    code.sub(r10, 16);
+    code.cmp(rbx, rcx);
+    code.je(hit_path, Near);
+    code.test(rbx, rbx);
+    code.jz(miss_path, Near);
+    code.cmp(r10, r9);
+    code.jae(probe_loop);
+
+    // Wrap to last bucket
+    code.L(wrap_setup);
+    code.mov(r10, r8);
+    code.shl(r10, 4);
+    code.add(r10, r9);
+
+    code.L(wrap_loop);
+    code.mov(rax, qword[r10]);
+    code.mov(rbx, qword[r10 + 8]);
+    code.sub(r10, 16);
+    code.cmp(rbx, rcx);
+    code.je(hit_path, Near);
+    code.test(rbx, rbx);
+    code.jz(miss_path, Near);
+    code.cmp(r10, r11);
+    code.ja(wrap_loop);
+    code.jmp(miss_path, Near);
+
+    code.L(hit_path);
+    code.xor_(rax, rdx);  // imp ^= class
+    // Optional counters (conf.inline_objc_hit_counter non-null).
+    if (conf.inline_objc_hit_counter) {
+        code.mov(rbx, reinterpret_cast<u64>(conf.inline_objc_hit_counter));
+        code.lock();
+        code.inc(qword[rbx]);
+    }
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
+    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+        code.jmp(terminal_handler_fast_dispatch_hint);
+    } else {
+        code.ReturnFromRunCode();
+    }
+
+    code.L(miss_path);
+    if (conf.inline_objc_miss_counter) {
+        code.mov(rbx, reinterpret_cast<u64>(conf.inline_objc_miss_counter));
+        code.lock();
+        code.inc(qword[rbx]);
+    }
+    // x15/x16 already set; go to __objc_msgSend_uncached
+    code.mov(rax, conf.inline_objc_uncached);
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
+    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+        code.jmp(terminal_handler_fast_dispatch_hint);
+    } else {
+        code.ReturnFromRunCode();
+    }
+
+    code.L(tagged_path);
+    if (conf.inline_objc_miss_counter) {
+        code.mov(rbx, reinterpret_cast<u64>(conf.inline_objc_miss_counter));
+        code.lock();
+        code.inc(qword[rbx]);
+    }
+    code.mov(rax, conf.inline_objc_tagged ? conf.inline_objc_tagged : conf.inline_objc_uncached);
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
+    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+        code.jmp(terminal_handler_fast_dispatch_hint);
+    } else {
+        code.ReturnFromRunCode();
+    }
+
+    code.L(nil_path);
+    // Match Apple nil msgSend: x0=0, x1=0, d0–d3=0, return to LR
+    code.mov(qword[r15 + reg_off(0)], u64(0));
+    code.mov(qword[r15 + reg_off(1)], u64(0));
+    for (size_t i = 0; i < 4; i++) {
+        code.mov(qword[r15 + vec_off(i)], u64(0));
+        code.mov(qword[r15 + vec_off(i) + 8], u64(0));
+    }
+    code.mov(rax, qword[r15 + reg_off(30)]);
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
+    code.jmp(terminal_handler_pop_rsb_hint);
+
+    code.int3();
+
+    const size_t size = static_cast<size_t>(code.getCurr() - entrypoint);
+    const A64::LocationDescriptor descriptor{location};
+    // Cover a small window so IC IVAU near the entry still finds us.
+    const auto range = boost::icl::discrete_interval<u64>::closed(descriptor.PC(), descriptor.PC() + 7);
+    block_ranges.AddRange(range, descriptor);
+    PerfMapRegister(entrypoint, code.getCurr(), "a64_inline_objc_msgSend");
+    auto bd = RegisterBlock(descriptor, entrypoint, size);
+    persistable_blocks.push_back({descriptor.UniqueHash(), entrypoint, size});
+    return bd;
+}
+
+namespace {
+
+constexpr char kPersistMagic[8] = {'A', '6', '4', 'J', 'C', '0', '1', '\0'};
+
+struct PersistHeader {
+    char magic[8];
+    u8 uuid[16];
+    u64 build_id;
+    u64 code_size;
+    u64 n_blocks;
+    u64 prelude_size;  // GetCodeBegin() - allocation base; must match on load
+};
+
+}  // namespace
+
+size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
+                                       u64 cache_lo, u64 cache_hi) {
+    // Unlink every block first. Linked jumps may target HostCall blocks (excluded from the
+    // descriptor list but still present in the slab); those bake ASLR-sensitive absolute
+    // addresses and crash on reload. After unlink, every terminal goes through the dispatcher.
+    code.EnableWriting();
+    for (const auto& [desc, _] : block_descriptors) {
+        Unpatch(desc);
+    }
+    // Shared mode also stores unlinked heads for atomic patch sites.
+    for (const auto& [site_addr, head] : unlinked_heads) {
+        std::memcpy(reinterpret_cast<void*>(site_addr), &head, 8);
+    }
+    code.DisableWriting();
+
+    const u8* begin = static_cast<const u8*>(code.GetCodeBegin());
+    const u8* end = code.getCurr<const u8*>();
+    if (!begin || end < begin) {
+        return 0;
+    }
+    const u64 code_size = static_cast<u64>(end - begin);
+
+    std::vector<PersistEntry> entries;
+    entries.reserve(persistable_blocks.size());
+    for (const auto& e : persistable_blocks) {
+        const A64::LocationDescriptor desc{IR::LocationDescriptor{e.location_descriptor}};
+        const u64 pc = desc.PC();
+        if (pc < cache_lo || pc >= cache_hi) {
+            continue;
+        }
+        const u8* ep = static_cast<const u8*>(e.entrypoint);
+        if (ep < begin || ep >= end) {
+            continue;
+        }
+        entries.push_back(e);
+    }
+    if (entries.empty()) {
+        return 0;
+    }
+
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        return 0;
+    }
+    PersistHeader hdr{};
+    std::memcpy(hdr.magic, kPersistMagic, 8);
+    std::memcpy(hdr.uuid, cache_uuid, 16);
+    hdr.build_id = build_id;
+    hdr.code_size = code_size;
+    hdr.n_blocks = entries.size();
+    hdr.prelude_size = reinterpret_cast<u64>(begin) - reinterpret_cast<u64>(code.getCode());
+    if (std::fwrite(&hdr, sizeof hdr, 1, f) != 1) {
+        std::fclose(f);
+        return 0;
+    }
+    for (const auto& e : entries) {
+        const u64 off = static_cast<u64>(static_cast<const u8*>(e.entrypoint) - begin);
+        const u64 sz = e.size;
+        const u64 desc = e.location_descriptor;
+        if (std::fwrite(&desc, 8, 1, f) != 1 || std::fwrite(&off, 8, 1, f) != 1 || std::fwrite(&sz, 8, 1, f) != 1) {
+            std::fclose(f);
+            return 0;
+        }
+    }
+    if (std::fwrite(begin, 1, code_size, f) != code_size) {
+        std::fclose(f);
+        return 0;
+    }
+    std::fclose(f);
+    return static_cast<size_t>(sizeof(PersistHeader) + entries.size() * 24 + code_size);
+}
+
+size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
+                                       u64 cache_lo, u64 cache_hi) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        return 0;
+    }
+    PersistHeader hdr{};
+    if (std::fread(&hdr, sizeof hdr, 1, f) != 1) {
+        std::fclose(f);
+        return 0;
+    }
+    if (std::memcmp(hdr.magic, kPersistMagic, 8) != 0 || hdr.build_id != build_id ||
+        std::memcmp(hdr.uuid, cache_uuid, 16) != 0) {
+        std::fclose(f);
+        return 0;
+    }
+    u8* begin = const_cast<u8*>(static_cast<const u8*>(code.GetCodeBegin()));
+    const u64 prelude_size = reinterpret_cast<u64>(begin) - reinterpret_cast<u64>(code.getCode());
+    if (hdr.prelude_size != prelude_size) {
+        std::fclose(f);
+        return 0;
+    }
+    if (hdr.code_size == 0 || hdr.code_size > code.SpaceRemaining()) {
+        std::fclose(f);
+        return 0;
+    }
+
+    std::vector<std::tuple<u64, u64, u64>> entries;
+    entries.resize(hdr.n_blocks);
+    for (u64 i = 0; i < hdr.n_blocks; i++) {
+        u64 desc = 0, off = 0, sz = 0;
+        if (std::fread(&desc, 8, 1, f) != 1 || std::fread(&off, 8, 1, f) != 1 || std::fread(&sz, 8, 1, f) != 1) {
+            std::fclose(f);
+            return 0;
+        }
+        entries[i] = {desc, off, sz};
+    }
+
+    code.EnableWriting();
+    if (std::fread(begin, 1, hdr.code_size, f) != hdr.code_size) {
+        code.DisableWriting();
+        std::fclose(f);
+        return 0;
+    }
+    code.SetCodePtr(begin + hdr.code_size);
+    code.DisableWriting();
+    std::fclose(f);
+
+    size_t loaded = 0;
+    persistable_blocks.clear();
+    for (const auto& [desc_v, off, sz] : entries) {
+        const A64::LocationDescriptor desc{IR::LocationDescriptor{desc_v}};
+        const u64 pc = desc.PC();
+        if (pc < cache_lo || pc >= cache_hi) {
+            continue;
+        }
+        if (off + sz > hdr.code_size) {
+            continue;
+        }
+        CodePtr ep = begin + off;
+        BlockDescriptor bd{ep, static_cast<size_t>(sz)};
+        block_descriptors.insert({IR::LocationDescriptor{desc_v}, bd});
+        const auto range = boost::icl::discrete_interval<u64>::closed(pc, pc + std::max<u64>(sz, 4) - 1);
+        block_ranges.AddRange(range, desc);
+        persistable_blocks.push_back({desc_v, ep, static_cast<size_t>(sz)});
+        loaded++;
+    }
+    ClearFastDispatchTable();
+    return loaded;
 }
 
 void A64EmitX64::ClearCache() {
@@ -163,6 +495,7 @@ void A64EmitX64::ClearCache() {
     fastmem_patch_info.clear();
     fastmem_recompile_markers.clear();
     unlinked_heads.clear();
+    persistable_blocks.clear();
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
@@ -392,6 +725,7 @@ static u32 GetFPSRImpl(A64JitState* jit_state) {
 }
 
 void A64EmitX64::EmitA64GetFPSR(A64EmitContext& ctx, IR::Inst* inst) {
+    ctx.has_host_call = true;
     ctx.reg_alloc.HostCall(inst);
     code.mov(code.ABI_PARAM1, code.r15);
     code.stmxcsr(code.dword[code.r15 + offsetof(A64JitState, guest_MXCSR)]);
@@ -479,6 +813,7 @@ static void SetFPCRImpl(A64JitState* jit_state, u32 value) {
 
 void A64EmitX64::EmitA64SetFPCR(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ctx.has_host_call = true;
     ctx.reg_alloc.HostCall(nullptr, {}, args[0]);
     code.mov(code.ABI_PARAM1, code.r15);
     code.CallFunction(SetFPCRImpl);
@@ -491,6 +826,7 @@ static void SetFPSRImpl(A64JitState* jit_state, u32 value) {
 
 void A64EmitX64::EmitA64SetFPSR(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ctx.has_host_call = true;
     ctx.reg_alloc.HostCall(nullptr, {}, args[0]);
     code.mov(code.ABI_PARAM1, code.r15);
     code.CallFunction(SetFPSRImpl);
@@ -512,18 +848,36 @@ void A64EmitX64::EmitA64SetPC(A64EmitContext& ctx, IR::Inst* inst) {
 }
 
 void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
+    ctx.has_host_call = true;
     ctx.reg_alloc.HostCall(nullptr);
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(args[0].IsImmediate());
     const u32 imm = args[0].GetImmediateU32();
+    // x86Code fuse_svc_ret: PC was set to svc+4 before this call (sentinel). Save it so we can
+    // tell a redirecting handler (SetPC) from a normal thunk that should return to X30.
+    if (conf.fuse_svc_ret) {
+        code.mov(code.rax, qword[r15 + offsetof(A64JitState, pc)]);
+        code.mov(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, fuse_svc_pc)], code.rax);
+    }
     Devirtualize<&A64::UserCallbacks::CallSVC>(conf.callbacks).EmitCall(code, [&](RegList param) {
         code.mov(param[0], imm);
     });
     // The kernel would have to execute ERET to get here, which would clear exclusive state.
     code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
+    if (conf.fuse_svc_ret) {
+        Xbyak::Label redirected;
+        code.mov(code.rax, qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, fuse_svc_pc)]);
+        code.cmp(qword[r15 + offsetof(A64JitState, pc)], code.rax);
+        code.jne(redirected);
+        // Normal thunk: return to caller (X30). Skips the separate "ret" block after svc.
+        code.mov(code.rax, qword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * 30]);
+        code.mov(qword[r15 + offsetof(A64JitState, pc)], code.rax);
+        code.L(redirected);
+    }
 }
 
 void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
+    ctx.has_host_call = true;
     ctx.reg_alloc.HostCall(nullptr);
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(args[0].IsImmediate() && args[1].IsImmediate());
@@ -537,12 +891,14 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64DataCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ctx.has_host_call = true;
     ctx.reg_alloc.HostCall(nullptr, {}, args[1], args[2]);
     Devirtualize<&A64::UserCallbacks::DataCacheOperationRaised>(conf.callbacks).EmitCall(code);
 }
 
 void A64EmitX64::EmitA64InstructionCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ctx.has_host_call = true;
     ctx.reg_alloc.HostCall(nullptr, {}, args[0], args[1]);
     Devirtualize<&A64::UserCallbacks::InstructionCacheOperationRaised>(conf.callbacks).EmitCall(code);
 }
@@ -561,6 +917,7 @@ void A64EmitX64::EmitA64InstructionSynchronizationBarrier(A64EmitContext& ctx, I
         return;
     }
 
+    ctx.has_host_call = true;
     ctx.reg_alloc.HostCall(nullptr);
     Devirtualize<&A64::UserCallbacks::InstructionSynchronizationBarrierRaised>(conf.callbacks).EmitCall(code);
 }
@@ -572,6 +929,7 @@ void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
 }
 
 void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
+    ctx.has_host_call = true;
     ctx.reg_alloc.HostCall(inst);
     if (!conf.wall_clock_cntpct) {
         code.UpdateTicks();

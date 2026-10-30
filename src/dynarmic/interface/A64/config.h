@@ -295,6 +295,19 @@ struct UserConfig {
     /// while the process runs (invalidation only unlinks blocks). callbacks must not depend on which Jit runs.
     bool shared_translations = false;
 
+    /// x86Code: after CallSVC, if the handler left PC at the insn after SVC (svc; ret thunk), set PC to X30
+    /// and dispatch — skip the separate ret block. Handlers that SetPC keep their redirect.
+    bool fuse_svc_ret = true;
+
+    /// x86Code: when non-zero, the block at this guest PC is emitted as a hand-written x86 objc_msgSend
+    /// cache probe (no A64 translate, no CallSVC). Hits FastDispatch to the IMP; misses go to uncached.
+    std::uint64_t inline_objc_msgsend = 0;
+    std::uint64_t inline_objc_uncached = 0;
+    std::uint64_t inline_objc_tagged = 0;
+    /// Optional atomic hit/miss counters (64-bit) updated with lock inc from the probe.
+    std::uint64_t* inline_objc_hit_counter = nullptr;
+    std::uint64_t* inline_objc_miss_counter = nullptr;
+
     /// Internal use only
     bool very_verbose_debugging_output = false;
 };

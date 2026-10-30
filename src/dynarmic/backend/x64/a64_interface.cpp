@@ -89,6 +89,24 @@ std::shared_ptr<Jit::SharedCode> Jit::MakeSharedCode(UserConfig conf) {
     return std::make_shared<SharedCode>(conf);
 }
 
+std::size_t Jit::SavePersistentCache(SharedCode& shared, const std::string& path,
+                                     const std::uint8_t cache_uuid[16], std::uint64_t build_id,
+                                     std::uint64_t cache_lo, std::uint64_t cache_hi) {
+    std::unique_lock lock{shared.mutex()};
+    return shared.emitter.SavePersistentCache(path, cache_uuid, build_id, cache_lo, cache_hi);
+}
+
+std::size_t Jit::LoadPersistentCache(SharedCode& shared, const std::string& path,
+                                     const std::uint8_t cache_uuid[16], std::uint64_t build_id,
+                                     std::uint64_t cache_lo, std::uint64_t cache_hi) {
+    std::unique_lock lock{shared.mutex()};
+    const size_t n = shared.emitter.LoadPersistentCache(path, cache_uuid, build_id, cache_lo, cache_hi);
+    if (n) {
+        shared.stats.blocks += n;
+    }
+    return n;
+}
+
 struct Jit::Impl final {
 public:
     Impl(Jit*, UserConfig thread_conf, std::shared_ptr<SharedCode> shared_)
@@ -355,8 +373,33 @@ private:
 
             // JIT Compile (unlocked when shared): MemoryReadCode must not need the shared mutex.
             const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
-            IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
-                                                {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+            // x86Code: hand-written objc_msgSend probe (no IR translate / no CallSVC).
+            if (conf.inline_objc_msgsend != 0) {
+                const A64::LocationDescriptor want{current_location};
+                if (want.PC() == conf.inline_objc_msgsend && !want.SingleStepping()) {
+                    if (conf.shared_translations) {
+                        lock.lock();
+                        if (auto block = emitter.GetBasicBlock(current_location))
+                            return block->entrypoint;
+                        if (shared->invalidate_gen != gen_at_miss) {
+                            lock.unlock();
+                            continue;
+                        }
+                    }
+                    const auto descriptor = emitter.EmitInlineObjCMsgSend(current_location);
+                    if (conf.shared_translations) {
+                        shared->stats.blocks++;
+                        shared->stats.guest_instructions += 8;
+                        shared->stats.code_bytes += descriptor.size;
+                    }
+                    return descriptor.entrypoint;
+                }
+            }
+            A64::TranslationOptions topts;
+            topts.define_unpredictable_behaviour = conf.define_unpredictable_behaviour;
+            topts.wall_clock_cntpct = conf.wall_clock_cntpct;
+            topts.memory_read_code = get_code;
+            IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code, topts);
             Optimization::PolyfillPass(ir_block, polyfill_options);
             Optimization::A64CallbackConfigPass(ir_block, conf);
             Optimization::NamingPass(ir_block);

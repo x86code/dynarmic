@@ -35,6 +35,9 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    /// x86Code: optional reader so SVC can peek the next insn and fuse "svc; ret" thunks.
+    MemoryReadCodeFuncType memory_read_code;
 };
 
 /**
