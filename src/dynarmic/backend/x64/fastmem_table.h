@@ -43,10 +43,40 @@ public:
         entries.push_back(e);
     }
 
+    // x86Code (Speed 7): sites of a static AOT image (sorted by off from static_base; cb indexes static_callbacks),
+    // usually in a file mapped shared by every process with the same layout. Searched after the dynamic entries.
+    struct StaticEntry {
+        u32 off;
+        u16 delta;
+        u16 cb;
+    };
+    static_assert(sizeof(StaticEntry) == 8);
+    void SetStatic(u64 sbase, const StaticEntry* e, size_t n, std::vector<u64> cbs) {
+        static_base = sbase;
+        static_entries = e;
+        static_n = n;
+        static_callbacks = std::move(cbs);
+    }
+    template<typename F>
+    void ForEachStatic(F&& f) const {
+        for (size_t i = 0; i < static_n; i++) {
+            const u64 fault = static_base + static_entries[i].off;
+            f(fault, FastmemPatchInfo{fault + static_entries[i].delta, static_callbacks[static_entries[i].cb]});
+        }
+    }
+
     const FastmemPatchInfo* Lookup(u64 fault) {
         if (const auto it = overflow.find(fault); it != overflow.end()) {
             found = it->second;
             return &found;
+        }
+        if (static_n && fault >= static_base && fault - static_base <= 0xFFFFFFFFu) {
+            const u32 off = static_cast<u32>(fault - static_base);
+            const StaticEntry* it = std::lower_bound(static_entries, static_entries + static_n, off, [](const StaticEntry& e, u32 o) { return e.off < o; });
+            if (it != static_entries + static_n && it->off == off) {
+                found = FastmemPatchInfo{fault + it->delta, static_callbacks[it->cb]};
+                return &found;
+            }
         }
         if (fault < base || fault - base > 0xFFFFFFFFu) {
             return nullptr;
@@ -82,9 +112,12 @@ public:
         entries.shrink_to_fit();
         overflow.clear();
         sorted = 0;
+        static_n = 0;
+        static_entries = nullptr;
     }
 
     size_t size() const { return entries.size() + overflow.size(); }
+    size_t static_size() const { return static_n; }
     size_t MemoryBytes() const { return entries.capacity() * sizeof(Entry) + overflow.bucket_count() * 32 + callbacks.capacity() * 8; }
 
 private:
@@ -109,6 +142,10 @@ private:
     }
 
     u64 base = 0;
+    u64 static_base = 0;
+    const StaticEntry* static_entries = nullptr;
+    size_t static_n = 0;
+    std::vector<u64> static_callbacks;
     size_t sorted = 0;
     std::vector<Entry> entries;
     tsl::robin_map<u64, FastmemPatchInfo> overflow;

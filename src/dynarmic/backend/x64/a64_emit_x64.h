@@ -107,7 +107,7 @@ protected:
     BlockRangeInformation<u64> block_ranges;
 
     struct FastDispatchEntry {
-        u64 location_descriptor = 0xFFFF'FFFF'FFFF'FFFFull;
+        u64 location_descriptor = 0;  // x86Code: stored inverted (~desc), so all-zero memory is an empty entry
         const void* code_ptr = nullptr;
     };
     static_assert(sizeof(FastDispatchEntry) == 0x10);
@@ -170,6 +170,8 @@ protected:
     // side map that stays empty when recompile_on_fastmem_failure is false (our default),
     // shrinking ~1.5M-entry bucket storage from ~224 MB (56 B/entry) to ~128 MB (32 B/entry).
     FastmemTable fastmem_patch_info;
+    std::vector<FastmemTable::StaticEntry> static_fm_own;  // static fastmem sites when the index file is not mapped
+    void PublishStaticIndex(const std::string& idx_path, std::vector<FastmemTable::StaticEntry> fm, std::vector<u64> cbs);
     tsl::robin_map<u64, DoNotFastmemMarker> fastmem_recompile_markers;
     std::set<DoNotFastmemMarker> do_not_fastmem;
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;

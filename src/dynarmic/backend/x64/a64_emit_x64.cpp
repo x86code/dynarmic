@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/personality.h>
+#include <malloc.h>
 #include <fcntl.h>
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include <immintrin.h>
@@ -452,7 +453,15 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     std::vector<PersistEntry> entries;
     entries.reserve(block_descriptors.size());
     std::vector<bool> in_persisted(code_size, false);
-    for (const auto& [loc, bd] : block_descriptors) {
+    // Speed 7: registered static blocks live only in lf_map + the live bitset
+    std::vector<std::pair<IR::LocationDescriptor, BlockDescriptor>> all_blocks(block_descriptors.begin(), block_descriptors.end());
+    for (size_t i = 0; static_image.active && i < static_image.n_blocks; i++) {
+        if (static_image.Live(i) && !static_image.Dead(i)) {
+            const auto& b = static_image.blocks[i];
+            all_blocks.push_back({IR::LocationDescriptor{b.desc}, BlockDescriptor{static_image.code_begin + b.off, b.size, 1}});
+        }
+    }
+    for (const auto& [loc, bd] : all_blocks) {
         if (!bd.persistable) {
             continue;
         }
@@ -508,7 +517,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     index_fb(2, exclusive_write_fallbacks);
     std::vector<FastmemPersist> fm_entries;
     fm_entries.reserve(fastmem_patch_info.size());
-    fastmem_patch_info.ForEach([&](u64 fault_rip, const FastmemPatchInfo& info) {
+    const auto save_fm = [&](u64 fault_rip, const FastmemPatchInfo& info) {
         if (fault_rip < begin_u || fault_rip >= end_u) {
             return;
         }
@@ -527,7 +536,17 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         e.fault_off = static_cast<s64>(fault_off);
         e.resume_off = static_cast<s64>(info.resume_rip - begin_u);
         fm_entries.push_back(e);
-    });
+    };
+    fastmem_patch_info.ForEach(save_fm);
+    fastmem_patch_info.ForEachStatic(save_fm);  // Speed 7: sites of the static image (in persisted = registered blocks)
+    // Speed 7: link sites of the static image, with the dynamic ones
+    const auto for_each_site = [&](auto&& f) {
+        patch_information.ForEach(f);
+        for (size_t i = 0; static_image.active && i < static_image.n_links; i++) {
+            const auto& l = static_image.links[i];
+            f(l.target, static_cast<PatchInformation::Kind>(l.kind), static_cast<CodePtr>(static_image.code_begin + l.site_off));
+        }
+    };
 
     // Scrub HostCall / unlisted gaps so a mid-block rel32 into them cannot run ASLR-stale code.
     // Deferred abort stubs live inside block.size (Emit runs deferred_emits before sizing).
@@ -538,7 +557,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         std::memcpy(slab.data() + off, begin + off, static_cast<size_t>(sz));
     }
     if (atomic_patch_sites) {
-        patch_information.ForEach([&](u64 target, PatchInformation::Kind kind, CodePtr site) {
+        for_each_site([&](u64 target, PatchInformation::Kind kind, CodePtr site) {
             const u64 site_addr = reinterpret_cast<u64>(site);
             if (kind != PatchInformation::MOV_RCX && site_addr >= begin_u && site_addr + 8 <= end_u && in_persisted[site_addr - begin_u]) {
                 const u64 head = UnlinkedHead(IR::LocationDescriptor{target});
@@ -552,7 +571,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     }
 
     std::vector<LinkPersist> links;
-    patch_information.ForEach([&](u64 target, PatchInformation::Kind kind, CodePtr site) {
+    for_each_site([&](u64 target, PatchInformation::Kind kind, CodePtr site) {
         const u64 sa = reinterpret_cast<u64>(site);
         if (kind == PatchInformation::MOV_RCX || sa < begin_u || sa + 8 > end_u || !in_persisted[sa - begin_u]) {
             return;
@@ -868,6 +887,10 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
             close(mfd);
         }
     }
+    // Speed 7: static image metadata (see EmitX64::StaticImage); X86CODE_A64_AOT_LAZY=0 registers every block as before.
+    const bool lazy = !map_path.empty() && !(std::getenv("X86CODE_A64_AOT_LAZY") && std::atoi(std::getenv("X86CODE_A64_AOT_LAZY")) == 0);
+    std::vector<FastmemTable::StaticEntry> static_fm;
+    std::vector<u64> static_cbs;
     code.EnableWriting();
     if (mapped) {
         std::fseek(f, static_cast<long>(hdr.code_size), SEEK_CUR);
@@ -937,7 +960,16 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         if (!fn) {
             continue;
         }
-        fastmem_patch_info.emplace(fault, FastmemPatchInfo{resume, reinterpret_cast<u64>(fn)});
+        const u64 delta = resume - fault;
+        if (lazy && delta <= 0xFFFF && static_cast<u64>(fm.fault_off) <= 0xFFFFFFFFu) {
+            const size_t ci = static_cast<size_t>(std::find(static_cbs.begin(), static_cbs.end(), reinterpret_cast<u64>(fn)) - static_cbs.begin());
+            if (ci == static_cbs.size()) {
+                static_cbs.push_back(reinterpret_cast<u64>(fn));
+            }
+            static_fm.push_back({static_cast<u32>(fm.fault_off), static_cast<u16>(delta), static_cast<u16>(ci)});
+        } else {
+            fastmem_patch_info.emplace(fault, FastmemPatchInfo{resume, reinterpret_cast<u64>(fn)});
+        }
         fm_bound++;
         // Abort stub shape: call wrapped_fn; <resume>. Patch E8 rel32 immediately before resume.
         if (fm.resume_off >= 5) {
@@ -971,7 +1003,56 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
     // block_ranges is for IC invalidation only; cover a single guest insn (4 bytes). Using host
     // size as a guest PC span (the old bug) made ranges hundreds of bytes wide and could
     // invalidate / confuse overlapping blocks after IVAU.
-    for (const auto& [desc_v, off, sz] : entries) {
+    size_t linked = 0;
+    if (lazy) {
+        std::vector<StaticImage::Block> sb;
+        sb.reserve(entries.size());
+        for (const auto& [desc_v, off, sz] : entries) {
+            const u64 pc = A64::LocationDescriptor{IR::LocationDescriptor{desc_v}}.PC();
+            if (pc >= cache_lo && pc < cache_hi && off + sz <= hdr.code_size) {
+                sb.push_back({desc_v, static_cast<u32>(off), static_cast<u32>(sz)});
+            }
+        }
+        std::stable_sort(sb.begin(), sb.end(), StaticImage::BlockLess);
+        sb.erase(std::unique(sb.begin(), sb.end(), [](const auto& a, const auto& b) { return a.desc == b.desc; }), sb.end());
+        std::vector<StaticImage::Link> sl;
+        sl.reserve(links.size());
+        for (const auto& l : links) {
+            if (static_cast<u64>(l.site_off) + 8 <= hdr.code_size && l.kind <= PatchInformation::JMP) {
+                sl.push_back({l.target, l.site_off, l.kind});
+            }
+        }
+        std::stable_sort(sl.begin(), sl.end(), [](const auto& a, const auto& b) { return a.target < b.target; });
+        std::sort(static_fm.begin(), static_fm.end(), [](const auto& a, const auto& b) { return a.off < b.off; });
+        static_image.Reset();
+        static_image.code_begin = begin;
+        static_image.own_blocks = std::move(sb);
+        static_image.own_links = std::move(sl);
+        static_image.blocks = static_image.own_blocks.data();
+        static_image.n_blocks = static_image.own_blocks.size();
+        static_image.links = static_image.own_links.data();
+        static_image.n_links = static_image.own_links.size();
+        if (!mapped) {
+            // image-internal sites are linked in the code (a mapped copy has them already)
+            const CodePtr save_code_ptr = code.getCurr();
+            patching = true;
+            code.EnableWriting();
+            for (size_t i = 0; i < static_image.n_links; i++) {
+                const auto& l = static_image.links[i];
+                const size_t t = static_image.Index(l.target);
+                if (t < static_image.n_blocks) {
+                    PatchSite(static_cast<PatchInformation::Kind>(l.kind), begin + l.site_off, IR::LocationDescriptor{l.target}, begin + static_image.blocks[t].off);
+                    linked++;
+                }
+            }
+            code.DisableWriting();
+            patching = false;
+            code.SetCodePtr(save_code_ptr);
+        }
+        patch_information.clear();
+        loaded = static_image.n_blocks;
+    }
+    for (const auto& [desc_v, off, sz] : (lazy ? decltype(entries){} : entries)) {
         const A64::LocationDescriptor desc{IR::LocationDescriptor{desc_v}};
         const u64 pc = desc.PC();
         if (pc < cache_lo || pc >= cache_hi) {
@@ -993,16 +1074,17 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         loaded++;
     }
     // Rebuild link sites (the slab holds every site in its unlinked form) and link callers to loaded blocks.
-    patch_information.clear();
-    for (const auto& l : links) {
+    if (!lazy) {
+        patch_information.clear();
+    }
+    for (const auto& l : (lazy ? decltype(links){} : links)) {
         if (static_cast<u64>(l.site_off) + 8 > hdr.code_size || l.kind > PatchInformation::JMP) {
             continue;
         }
         CodePtr site = begin + l.site_off;
         patch_information.Add(IR::LocationDescriptor{l.target}, static_cast<PatchInformation::Kind>(l.kind), site);
     }
-    size_t linked = 0;
-    if (!std::getenv("X86CODE_A64_JITCACHE_NOLINK")) {
+    if (!lazy && !std::getenv("X86CODE_A64_JITCACHE_NOLINK")) {
         code.EnableWriting();
         for (const auto& [desc, bd] : block_descriptors) {
             if (patch_information.count(desc)) {
@@ -1062,8 +1144,102 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
             }
         }
     }
+    if (lazy) {
+        PublishStaticIndex(map_path + ".idx", std::move(static_fm), std::move(static_cbs));
+    }
     ClearFastDispatchTable();
     return loaded;
+}
+
+namespace {
+constexpr char kIndexMagic[8] = {'A', '6', '4', 'I', 'D', 'X', '0', '1'};
+struct IndexHeader {
+    char magic[8];
+    u64 n_blocks, n_links, n_fm, n_cbs;
+};
+}  // namespace
+
+// Speed 7: the first process with a layout writes the static arrays to <map>.idx (published with link(), like the
+// .map); every process maps the file shared and drops its private arrays when the contents match.
+void A64EmitX64::PublishStaticIndex(const std::string& idx_path, std::vector<FastmemTable::StaticEntry> fm, std::vector<u64> cbs) {
+    static_image.dead.assign((static_image.n_blocks + 63) / 64, 0);
+    static_image.live.assign((static_image.n_blocks + 63) / 64, 0);
+    static_image.active = true;
+    const u8* begin = static_image.code_begin;
+    IndexHeader h{};
+    std::memcpy(h.magic, kIndexMagic, 8);
+    h.n_blocks = static_image.n_blocks;
+    h.n_links = static_image.n_links;
+    h.n_fm = fm.size();
+    h.n_cbs = cbs.size();
+    const size_t o_cbs = sizeof h, o_blocks = o_cbs + cbs.size() * 8, o_links = o_blocks + h.n_blocks * sizeof(StaticImage::Block),
+                 o_fm = o_links + h.n_links * sizeof(StaticImage::Link), len = o_fm + fm.size() * sizeof(FastmemTable::StaticEntry);
+    const auto same = [&](const u8* m) {
+        return std::memcmp(m, &h, sizeof h) == 0 && std::memcmp(m + o_cbs, cbs.data(), cbs.size() * 8) == 0 &&
+               std::memcmp(m + o_blocks, static_image.blocks, h.n_blocks * sizeof(StaticImage::Block)) == 0 &&
+               std::memcmp(m + o_links, static_image.links, h.n_links * sizeof(StaticImage::Link)) == 0 &&
+               std::memcmp(m + o_fm, fm.data(), fm.size() * sizeof(FastmemTable::StaticEntry)) == 0;
+    };
+    int fd = open(idx_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0 && (personality(0xffffffff) & ADDR_NO_RANDOMIZE)) {
+        const std::string tmp = idx_path + ".tmp." + std::to_string(getpid());
+        if (FILE* w = std::fopen(tmp.c_str(), "wb")) {
+            bool ok = std::fwrite(&h, sizeof h, 1, w) == 1;
+            ok = ok && std::fwrite(cbs.data(), 8, cbs.size(), w) == cbs.size();
+            ok = ok && std::fwrite(static_image.blocks, sizeof(StaticImage::Block), h.n_blocks, w) == h.n_blocks;
+            ok = ok && std::fwrite(static_image.links, sizeof(StaticImage::Link), h.n_links, w) == h.n_links;
+            ok = ok && std::fwrite(fm.data(), sizeof(FastmemTable::StaticEntry), fm.size(), w) == fm.size();
+            ok = std::fclose(w) == 0 && ok;
+            if (ok) {
+                (void)link(tmp.c_str(), idx_path.c_str());
+            }
+            unlink(tmp.c_str());
+        }
+        fd = open(idx_path.c_str(), O_RDONLY | O_CLOEXEC);
+    }
+    struct stat st {};
+    void* m = MAP_FAILED;
+    if (fd >= 0 && fstat(fd, &st) == 0 && static_cast<size_t>(st.st_size) == len) {
+        m = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
+        if (m != MAP_FAILED && !same(static_cast<const u8*>(m))) {
+            const u8* mm = static_cast<const u8*>(m);
+            std::fprintf(stderr, "a64jitcache: %s differs from this process's index (hdr %d cbs %d blocks %d links %d fm %d); not mapped\n", idx_path.c_str(),
+                         std::memcmp(mm, &h, sizeof h) != 0, std::memcmp(mm + o_cbs, cbs.data(), cbs.size() * 8) != 0,
+                         std::memcmp(mm + o_blocks, static_image.blocks, h.n_blocks * sizeof(StaticImage::Block)) != 0,
+                         std::memcmp(mm + o_links, static_image.links, h.n_links * sizeof(StaticImage::Link)) != 0,
+                         std::memcmp(mm + o_fm, fm.data(), fm.size() * sizeof(FastmemTable::StaticEntry)) != 0);
+            if (const char* d = std::getenv("X86CODE_A64_IDX_DUMP")) {
+                if (FILE* w = std::fopen((std::string(d) + "/idx." + std::to_string(getpid())).c_str(), "wb")) {
+                    std::fwrite(&h, sizeof h, 1, w);
+                    std::fwrite(cbs.data(), 8, cbs.size(), w);
+                    std::fwrite(static_image.blocks, sizeof(StaticImage::Block), h.n_blocks, w);
+                    std::fwrite(static_image.links, sizeof(StaticImage::Link), h.n_links, w);
+                    std::fwrite(fm.data(), sizeof(FastmemTable::StaticEntry), fm.size(), w);
+                    std::fclose(w);
+                }
+            }
+            munmap(m, len);
+            m = MAP_FAILED;
+        }
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (m != MAP_FAILED) {
+        const u8* mb = static_cast<const u8*>(m);
+        static_image.map = m;
+        static_image.map_len = len;
+        static_image.blocks = reinterpret_cast<const StaticImage::Block*>(mb + o_blocks);
+        static_image.links = reinterpret_cast<const StaticImage::Link*>(mb + o_links);
+        static_image.own_blocks = {};
+        static_image.own_links = {};
+        static_fm_own = {};
+        fastmem_patch_info.SetStatic(reinterpret_cast<u64>(begin), reinterpret_cast<const FastmemTable::StaticEntry*>(mb + o_fm), fm.size(), std::move(cbs));
+    } else {
+        static_fm_own = std::move(fm);
+        fastmem_patch_info.SetStatic(reinterpret_cast<u64>(begin), static_fm_own.data(), static_fm_own.size(), std::move(cbs));
+    }
+    malloc_trim(0);
 }
 
 std::string A64EmitX64::MemoryReport() const {
@@ -1071,12 +1247,14 @@ std::string A64EmitX64::MemoryReport() const {
     char buf[512];
     std::snprintf(buf, sizeof buf,
                   "block_descriptors %.1f (%zu) patch_information %.1f (%zu) block_ranges %.1f fastmem %.1f (%zu) "
-                  "relocs %.1f lf_map %.1f",
+                  "relocs %.1f lf_map %.1f static %zu blocks (%zu registered, %zu dead bits) %zu links %zu fm %s",
                   mb(block_descriptors.bucket_count() * (sizeof(IR::LocationDescriptor) + sizeof(BlockDescriptor) + 8)), block_descriptors.size(),
                   mb(patch_information.MemoryBytes()), patch_information.size(),
                   mb(block_ranges.MemoryBytes()),
                   mb(fastmem_patch_info.MemoryBytes()), fastmem_patch_info.size(),
-                  mb(reloc_entries.capacity() * sizeof(RelocEntry)), mb(lf_map.MemoryBytes()));
+                  mb(reloc_entries.capacity() * sizeof(RelocEntry)), mb(lf_map.MemoryBytes()),
+                  static_image.n_blocks, static_image.registered, static_image.dead.size() * 64, static_image.n_links,
+                  fastmem_patch_info.static_size(), static_image.map ? "mapped" : (static_image.active ? "private" : "off"));
     return buf;
 }
 
@@ -1090,21 +1268,35 @@ void A64EmitX64::ClearCache() {
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    auto locations = block_ranges.InvalidateRanges(ranges);
+    if (static_image.active) {
+        // static blocks cover one guest insn [pc, pc+3], as block_ranges did for loaded blocks
+        for (const auto& r : ranges) {
+            const u64 first = boost::icl::first(r), last = boost::icl::last(r);
+            if (last < first) {
+                continue;
+            }
+            const u64 lo = first >= 3 ? first - 3 : 0;
+            const u64 hi = last;
+            const StaticImage::Block key{lo, 0, 0};
+            for (const auto* b = std::lower_bound(static_image.blocks, static_image.blocks + static_image.n_blocks, key, StaticImage::BlockLess);
+                 b != static_image.blocks + static_image.n_blocks && StaticImage::Pc(b->desc) <= hi; b++) {
+                if (!static_image.Dead(static_cast<size_t>(b - static_image.blocks))) {
+                    locations.insert(IR::LocationDescriptor{b->desc});
+                }
+            }
+        }
+    }
+    InvalidateBasicBlocks(locations);
 }
 
 void A64EmitX64::ClearFastDispatchTable() {
     if (!conf.HasOptimization(OptimizationFlag::FastDispatch)) {
         return;
     }
-    if (conf.shared_translations) {
-        // Concurrent FD lookups use aligned 16-byte loads; clear each entry the same way Unpatch does.
-        for (auto& entry : fast_dispatch_table) {
-            _mm_store_si128(reinterpret_cast<__m128i*>(&entry), _mm_set_epi64x(0, -1));
-        }
-    } else {
-        fast_dispatch_table.fill({});
-    }
+    // x86Code: keys are stored inverted (empty = all-zero bytes), so a clear drops the pages instead of writing 4 MB
+    // per process; a concurrent reader sees either the old entry or zeros (a miss).
+    madvise(fast_dispatch_table.data(), fast_dispatch_table_size * sizeof(FastDispatchEntry), MADV_DONTNEED);
 }
 
 void A64EmitX64::GenTerminalHandlers() {
@@ -1159,23 +1351,30 @@ void A64EmitX64::GenTerminalHandlers() {
             Xbyak::Label shared_miss;
             code.movdqa(xmm0, xword[rbp]);
             code.movq(rax, xmm0);
+            code.not_(rax);
             code.cmp(rbx, rax);
             code.jne(shared_miss);
             code.pextrq(rax, xmm0, 1);
             code.jmp(rax);
             code.L(shared_miss);
             code.LookupBlock();
+            code.not_(rbx);
             code.movq(xmm0, rbx);
+            code.not_(rbx);
             code.movq(xmm1, rax);
             code.punpcklqdq(xmm0, xmm1);
             code.movdqa(xword[rbp], xmm0);
             code.jmp(rax);
         }
-        code.cmp(rbx, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);
+        code.mov(rax, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);
+        code.not_(rax);
+        code.cmp(rbx, rax);
         code.jne(fast_dispatch_cache_miss);
         code.jmp(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
         code.L(fast_dispatch_cache_miss);
+        code.not_(rbx);
         code.mov(qword[rbp + offsetof(FastDispatchEntry, location_descriptor)], rbx);
+        code.not_(rbx);
         code.LookupBlock();
         code.mov(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)], rax);
         code.jmp(rax);
@@ -1829,7 +2028,7 @@ void A64EmitX64::Unpatch(const IR::LocationDescriptor& location) {
         code.DisableWriting();
         auto& entry = (*fast_dispatch_table_lookup)(location.Value());
         if (conf.shared_translations) {
-            _mm_store_si128(reinterpret_cast<__m128i*>(&entry), _mm_set_epi64x(0, -1));
+            _mm_store_si128(reinterpret_cast<__m128i*>(&entry), _mm_setzero_si128());
         } else {
             entry = {};
         }

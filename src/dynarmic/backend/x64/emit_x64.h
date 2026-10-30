@@ -84,7 +84,8 @@ public:
     virtual ~EmitX64();
 
     /// Looks up an emitted host block in the cache.
-    std::optional<BlockDescriptor> GetBasicBlock(IR::LocationDescriptor descriptor) const;
+    /// x86Code: registers a static AOT image block on its first lookup (callers hold the emitter lock).
+    std::optional<BlockDescriptor> GetBasicBlock(IR::LocationDescriptor descriptor);
 
     /// x86Code: lock-free GetBasicBlock for the dispatcher hit path (shared translations: GetBasicBlock needs the
     /// shared mutex, this does not). nullptr = not known here; the caller falls back to the locked path.
@@ -223,6 +224,51 @@ protected:
         static void Insert(Table* t, u64 k, CodePtr c);
     } lf_map;
     PatchTable patch_information;
+
+    // x86Code (Speed 7): the AOT image's metadata as sorted arrays, in a file mapped shared by every process with the
+    // same layout (or private arrays). Was copied into block_descriptors/lf_map/patch_information/block_ranges/
+    // fastmem for all ~1M blocks in every AOT process (~300 MB each). A block now goes into block_descriptors and
+    // lf_map on its first lookup; link sites and PC ranges are queried here. Image-internal sites are linked in the
+    // mapped code already. Invalidated blocks get a dead bit and are never registered from here again.
+    struct StaticImage {
+        struct Block {
+            u64 desc;
+            u32 off;   // entrypoint - code begin
+            u32 size;
+        };
+        struct Link {
+            u64 target;
+            u32 site_off;
+            u32 kind;  // PatchInformation::Kind (JG/JZ/JMP)
+        };
+        bool active = false;
+        u8* code_begin = nullptr;
+        const Block* blocks = nullptr;  // sorted by (Pc(desc), desc)
+        size_t n_blocks = 0;
+        const Link* links = nullptr;  // sorted by target
+        size_t n_links = 0;
+        std::vector<u64> dead;
+        std::vector<u64> live;  // registered in lf_map (static blocks never go into block_descriptors)
+        size_t registered = 0;
+        void* map = nullptr;
+        size_t map_len = 0;
+        std::vector<Block> own_blocks;
+        std::vector<Link> own_links;
+
+        static u64 Pc(u64 desc) { return desc & ((u64(1) << 56) - 1); }
+        static bool BlockLess(const Block& a, const Block& b) { return Pc(a.desc) != Pc(b.desc) ? Pc(a.desc) < Pc(b.desc) : a.desc < b.desc; }
+        // index of desc's block or n_blocks
+        size_t Index(u64 desc) const;
+        bool Dead(size_t i) const { return (dead[i >> 6] >> (i & 63)) & 1; }
+        void Kill(size_t i) { dead[i >> 6] |= u64(1) << (i & 63); }
+        bool Live(size_t i) const { return (live[i >> 6] >> (i & 63)) & 1; }
+        void SetLive(size_t i, bool v) { v ? live[i >> 6] |= u64(1) << (i & 63) : live[i >> 6] &= ~(u64(1) << (i & 63)); }
+        std::pair<const Link*, const Link*> Sites(u64 target) const;
+        void Reset();
+    } static_image;
+    // static sites of target_desc, relinked to target_code_ptr (nullptr: unlinked)
+    void PatchStaticSites(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
+    void PatchSite(PatchInformation::Kind kind, CodePtr location, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
 };
 
 }  // namespace Dynarmic::Backend::X64

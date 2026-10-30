@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include "dynarmic/backend/x64/emit_x64.h"
 
+#include <algorithm>
 #include <iterator>
 
 #include <mcl/assert.hpp>
@@ -126,12 +127,72 @@ void EmitX64::LockFreeBlockMap::Clear() {
     }
 }
 
-std::optional<EmitX64::BlockDescriptor> EmitX64::GetBasicBlock(IR::LocationDescriptor descriptor) const {
+std::optional<EmitX64::BlockDescriptor> EmitX64::GetBasicBlock(IR::LocationDescriptor descriptor) {
     const auto iter = block_descriptors.find(descriptor);
-    if (iter == block_descriptors.end()) {
-        return std::nullopt;
+    if (iter != block_descriptors.end()) {
+        return iter->second;
     }
-    return iter->second;
+    if (static_image.active) {
+        const size_t i = static_image.Index(descriptor.Value());
+        if (i < static_image.n_blocks && !static_image.Dead(i)) {
+            const auto& b = static_image.blocks[i];
+            const BlockDescriptor bd{static_image.code_begin + b.off, b.size, 1};
+            if (!static_image.Live(i)) {
+                static_image.SetLive(i, true);
+                lf_map.Set(descriptor.Value(), bd.entrypoint);
+                static_image.registered++;
+            }
+            return bd;
+        }
+    }
+    return std::nullopt;
+}
+
+size_t EmitX64::StaticImage::Index(u64 desc) const {
+    const Block key{desc, 0, 0};
+    const Block* it = std::lower_bound(blocks, blocks + n_blocks, key, BlockLess);
+    return it != blocks + n_blocks && it->desc == desc ? static_cast<size_t>(it - blocks) : n_blocks;
+}
+
+std::pair<const EmitX64::StaticImage::Link*, const EmitX64::StaticImage::Link*> EmitX64::StaticImage::Sites(u64 target) const {
+    const Link* lo = std::lower_bound(links, links + n_links, target, [](const Link& l, u64 t) { return l.target < t; });
+    const Link* hi = lo;
+    while (hi != links + n_links && hi->target == target) {
+        hi++;
+    }
+    return {lo, hi};
+}
+
+void EmitX64::StaticImage::Reset() {
+    if (map) {
+        munmap(map, map_len);
+    }
+    *this = StaticImage{};
+}
+
+void EmitX64::PatchSite(PatchInformation::Kind kind, CodePtr location, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    code.SetCodePtr(location);
+    switch (kind) {
+    case PatchInformation::JG:
+        EmitPatchJg(target_desc, target_code_ptr);
+        break;
+    case PatchInformation::JZ:
+        EmitPatchJz(target_desc, target_code_ptr);
+        break;
+    case PatchInformation::JMP:
+        EmitPatchJmp(target_desc, target_code_ptr);
+        break;
+    case PatchInformation::MOV_RCX:
+        EmitPatchMovRcx(target_code_ptr);
+        break;
+    }
+}
+
+void EmitX64::PatchStaticSites(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    const auto [lo, hi] = static_image.Sites(target_desc.Value());
+    for (const auto* l = lo; l != hi; l++) {
+        PatchSite(static_cast<PatchInformation::Kind>(l->kind), static_image.code_begin + l->site_off, target_desc, target_code_ptr);
+    }
 }
 
 void EmitX64::EmitVoid(EmitContext&, IR::Inst*) {
@@ -158,10 +219,8 @@ void EmitX64::EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst) {
 void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target) {
     using namespace Xbyak::util;
 
-    const auto iter = block_descriptors.find(target);
-    CodePtr target_code_ptr = iter != block_descriptors.end()
-                                ? iter->second.entrypoint
-                                : code.GetReturnFromRunCodeAddress();
+    const auto block = GetBasicBlock(target);
+    CodePtr target_code_ptr = block ? block->entrypoint : code.GetReturnFromRunCodeAddress();
 
     code.mov(index_reg.cvt32(), dword[r15 + code.GetJitStateInfo().offsetof_rsb_ptr]);
 
@@ -446,29 +505,18 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
     patching = true;
 
     patch_information.ForEachSite(target_desc, [&](PatchInformation::Kind kind, CodePtr location) {
-        code.SetCodePtr(location);
-        switch (kind) {
-        case PatchInformation::JG:
-            EmitPatchJg(target_desc, target_code_ptr);
-            break;
-        case PatchInformation::JZ:
-            EmitPatchJz(target_desc, target_code_ptr);
-            break;
-        case PatchInformation::JMP:
-            EmitPatchJmp(target_desc, target_code_ptr);
-            break;
-        case PatchInformation::MOV_RCX:
-            EmitPatchMovRcx(target_code_ptr);
-            break;
-        }
+        PatchSite(kind, location, target_desc, target_code_ptr);
     });
+    if (static_image.active) {
+        PatchStaticSites(target_desc, target_code_ptr);
+    }
 
     patching = false;
     code.SetCodePtr(save_code_ptr);
 }
 
 void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
-    if (patch_information.count(target_desc)) {
+    if (patch_information.count(target_desc) || (static_image.active && static_image.Sites(target_desc.Value()).first != static_image.Sites(target_desc.Value()).second)) {
         Patch(target_desc, nullptr);
     }
 }
@@ -477,6 +525,7 @@ void EmitX64::ClearCache() {
     block_descriptors.clear();
     lf_map.Clear();
     patch_information.clear();
+    static_image.Reset();
 
     PerfMapClear();
 }
@@ -489,14 +538,28 @@ void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>
 
     for (const auto& descriptor : locations) {
         const auto it = block_descriptors.find(descriptor);
-        if (it == block_descriptors.end()) {
+        bool known = it != block_descriptors.end();
+        if (static_image.active) {
+            const size_t i = static_image.Index(descriptor.Value());
+            if (i < static_image.n_blocks && !static_image.Dead(i)) {
+                static_image.Kill(i);
+                if (static_image.Live(i)) {
+                    static_image.SetLive(i, false);
+                    lf_map.Set(descriptor.Value(), nullptr);
+                }
+                known = true;
+            }
+        }
+        if (!known) {
             continue;
         }
 
         Unpatch(descriptor);
 
-        lf_map.Set(descriptor.Value(), nullptr);
-        block_descriptors.erase(it);
+        if (it != block_descriptors.end()) {
+            lf_map.Set(descriptor.Value(), nullptr);
+            block_descriptors.erase(it);
+        }
     }
 }
 
