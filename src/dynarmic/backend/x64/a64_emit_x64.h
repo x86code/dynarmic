@@ -108,8 +108,9 @@ protected:
     };
     static_assert(sizeof(FastDispatchEntry) == 0x10);
     // x86Code: 64K entries (1 MB) instead of 1M (16 MB, all touched when cleared): there is one Jit per guest thread
-    static constexpr u64 fast_dispatch_table_mask = 0xFFFF0;
-    static constexpr size_t fast_dispatch_table_size = 0x10000;
+    // x86Code: 256K entries (4 MB); 64K thrashed with 175K-750K-block hot sets (SpringBoard startup: ~35% in GetBlock).
+    static constexpr u64 fast_dispatch_table_mask = 0x3FFFF0;
+    static constexpr size_t fast_dispatch_table_size = 0x40000;
     alignas(16) std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;  // 16-byte atomic entries when shared
     // x86Code shared translations: original first 8 bytes of each unlinked jg/jz/jmp patch site
     tsl::robin_map<u64, u64> unlinked_heads;
