@@ -89,6 +89,10 @@ public:
 
         const u64 address = reinterpret_cast<u64>(fn);
         const u64 distance = address - (getCurr<u64>() + 5);
+        // x86Code: a call into host code (rel32 or abs64) bakes this process's ASLR layout into the block.
+        if (call_flag) {
+            *call_flag = true;
+        }
 
         if (distance >= 0x0000000080000000ULL && distance < 0xFFFFFFFF80000000ULL) {
             // Far call
@@ -98,6 +102,10 @@ public:
             call(fn);
         }
     }
+
+    /// x86Code: while set (A64 block emission), CallFunction marks *flag so the persistent cache skips the block
+    /// (FP/vector fallbacks, NaN handlers etc. call host functions without going through RegAlloc::HostCall).
+    void SetCallFlag(bool* flag) { call_flag = flag; }
 
     /// Code emitter: Calls the lambda. Lambda must not have any captures.
     template<typename Lambda>
@@ -189,6 +197,7 @@ private:
     JitStateInfo jsi;
 
     bool prelude_complete = false;
+    bool* call_flag = nullptr;
     CodePtr code_begin = nullptr;
 
 #ifdef _WIN32

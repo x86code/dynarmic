@@ -69,4 +69,7 @@ private:
     std::unique_ptr<Impl> impl;
 };
 
+/// x86Code: true if host_pc lies in a registered JIT code block (POSIX only; async-signal-safe).
+bool IsJitCodeAddress(u64 host_pc);
+
 }  // namespace Dynarmic::Backend

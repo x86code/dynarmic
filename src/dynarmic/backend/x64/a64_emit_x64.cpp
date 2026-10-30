@@ -103,6 +103,10 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 
     RegAlloc reg_alloc{code, gpr_order, any_xmm};
     A64EmitContext ctx{conf, reg_alloc, block};
+    code.SetCallFlag(&ctx.has_host_call);
+    SCOPE_EXIT {
+        code.SetCallFlag(nullptr);
+    };
 
     // Start emitting.
     code.align();

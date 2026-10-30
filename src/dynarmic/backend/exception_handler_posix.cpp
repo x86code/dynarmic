@@ -18,6 +18,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -123,12 +124,24 @@ SigHandler::~SigHandler() {
     std::free(signal_stack_memory);
 }
 
+// x86Code: lock-free copy of the registered code ranges for IsJitCodeAddress (async-signal-safe: no mutex, no alloc).
+constexpr size_t kMaxRanges = 16;
+std::atomic<u64> range_lo[kMaxRanges], range_hi[kMaxRanges];
+
+void PublishRanges(const std::vector<CodeBlockInfo>& infos) {
+    for (size_t i = 0; i < kMaxRanges; i++) {
+        range_hi[i].store(i < infos.size() ? infos[i].code_end : 0, std::memory_order_release);
+        range_lo[i].store(i < infos.size() ? infos[i].code_begin : 0, std::memory_order_release);
+    }
+}
+
 void SigHandler::AddCodeBlock(CodeBlockInfo cbi) {
     std::lock_guard<std::mutex> guard(code_block_infos_mutex);
     if (auto iter = FindCodeBlockInfo(cbi.code_begin); iter != code_block_infos.end()) {
         code_block_infos.erase(iter);
     }
     code_block_infos.push_back(cbi);
+    PublishRanges(code_block_infos);
 }
 
 void SigHandler::RemoveCodeBlock(u64 host_pc) {
@@ -138,6 +151,7 @@ void SigHandler::RemoveCodeBlock(u64 host_pc) {
         return;
     }
     code_block_infos.erase(iter);
+    PublishRanges(code_block_infos);
 }
 
 void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
@@ -321,6 +335,15 @@ void ExceptionHandler::Register(RV64::CodeBlock& mem, std::size_t size) {
 #else
 #    error "Invalid architecture"
 #endif
+
+bool IsJitCodeAddress(u64 host_pc) {
+    for (size_t i = 0; i < kMaxRanges; i++) {
+        if (host_pc >= range_lo[i].load(std::memory_order_acquire) && host_pc < range_hi[i].load(std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 bool ExceptionHandler::SupportsFastmem() const noexcept {
     return static_cast<bool>(impl) && sig_handler->SupportsFastmem();
