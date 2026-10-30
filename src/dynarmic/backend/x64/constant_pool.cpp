@@ -35,4 +35,23 @@ Xbyak::Address ConstantPool::GetConstant(const Xbyak::AddressFrame& frame, u64 l
     return frame[code.rip + iter->second];
 }
 
+void ConstantPool::Restore(const u8* data, size_t used_bytes) {
+    ASSERT(used_bytes <= pool.size_bytes());
+    ASSERT(used_bytes % align_size == 0);
+    if (used_bytes == 0) {
+        return;
+    }
+    std::memcpy(pool.data(), data, used_bytes);
+    const size_t new_point = used_bytes / align_size;
+    // Never move insertion_point backwards — GenRunCode may already own low slots.
+    if (new_point > insertion_point) {
+        insertion_point = new_point;
+    }
+    // Rebuild the lookup map from restored slots so later GetConstant reuses them.
+    constant_info.clear();
+    for (size_t i = 0; i < insertion_point; i++) {
+        constant_info.insert({pool[i], &pool[i]});
+    }
+}
+
 }  // namespace Dynarmic::Backend::X64

@@ -5,6 +5,7 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include <immintrin.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -338,7 +339,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::EmitInlineObjCMsgSend(IR::LocationDescri
 namespace {
 
 // A64JC04: reloc table + fastmem sites with callback rebound by fallback key (not absolute prelude addr).
-constexpr char kPersistMagic[8] = {'A', '6', '4', 'J', 'C', '0', '4', '\0'};
+// A64JC05: also persist the x86 constant pool (RIP targets from movi/FP immediates).
+constexpr char kPersistMagic[8] = {'A', '6', '4', 'J', 'C', '0', '5', '\0'};
 
 struct PersistHeader {
     char magic[8];
@@ -350,6 +352,7 @@ struct PersistHeader {
     u64 n_relocs;
     u64 n_fastmem;
     u64 old_bases[static_cast<size_t>(A64EmitX64::RelocKind::Count)];
+    u64 const_pool_used;  // bytes of ConstantPool to restore after the code slab
 };
 
 // fault/resume are code_begin-relative; callback is rebound on load via the live fallback table
@@ -401,23 +404,17 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     }
     const u64 code_size = static_cast<u64>(end - begin);
 
-    const u64 begin_u_early = reinterpret_cast<u64>(begin);
-    const u64 end_u_early = begin_u_early + code_size;
-    // Default: exclude blocks that own a fastmem site. Their abort stubs / vaddr state still
-    // misbehave across reload (warm hello MAPERR at a bogus VA); non-fastmem blocks load and
-    // run correctly (measured). X86CODE_A64_JITCACHE_FASTMEM=1 includes them for further work.
-    const bool drop_fastmem_blocks =
-        !(std::getenv("X86CODE_A64_JITCACHE_FASTMEM") && atoi(std::getenv("X86CODE_A64_JITCACHE_FASTMEM")) == 1);
-    std::vector<bool> fault_in_slab(drop_fastmem_blocks ? code_size : 0);
-    if (drop_fastmem_blocks) {
-        for (const auto& [fault_rip, _] : fastmem_patch_info) {
-            if (fault_rip >= begin_u_early && fault_rip < end_u_early) {
-                fault_in_slab[fault_rip - begin_u_early] = true;
-            }
-        }
-    }
+    const u64 begin_u = reinterpret_cast<u64>(begin);
+    const u64 end_u = begin_u + code_size;
+    const u64 alloc_u = reinterpret_cast<u64>(code.getCode());
+
+    // Persist every non-HostCall block in the dyld-cache range, including those with fastmem
+    // sites. HostCall blocks stay out of the descriptor list (absolute CallFunction embeds) but
+    // their bytes remain in the slab — scrub those gaps to int3 below so a stray rel32 cannot
+    // execute stale absolute Imm64s (warm MAPERR root cause).
     std::vector<PersistEntry> entries;
     entries.reserve(persistable_blocks.size());
+    std::vector<bool> in_persisted(code_size, false);
     for (const auto& e : persistable_blocks) {
         const A64::LocationDescriptor desc{IR::LocationDescriptor{e.location_descriptor}};
         const u64 pc = desc.PC();
@@ -428,18 +425,13 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         if (ep < begin || ep >= end) {
             continue;
         }
-        if (drop_fastmem_blocks) {
-            const u64 eoff = reinterpret_cast<u64>(ep) - begin_u_early;
-            bool has_fm = false;
-            for (u64 i = eoff; i < eoff + e.size && i < code_size; i++) {
-                if (fault_in_slab[i]) {
-                    has_fm = true;
-                    break;
-                }
-            }
-            if (has_fm) {
-                continue;
-            }
+        const u64 eoff = reinterpret_cast<u64>(ep) - begin_u;
+        if (eoff >= code_size) {
+            continue;
+        }
+        const u64 eend = std::min(eoff + static_cast<u64>(e.size), code_size);
+        for (u64 i = eoff; i < eend; i++) {
+            in_persisted[i] = true;
         }
         entries.push_back(e);
     }
@@ -456,10 +448,8 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         }
     }
 
-    // Fastmem fault sites: rebind callbacks by fallback-table key on load (not absolute prelude addr).
-    const u64 begin_u = reinterpret_cast<u64>(begin);
-    const u64 end_u = begin_u + code_size;
-    const u64 alloc_u = reinterpret_cast<u64>(code.getCode());
+    // Fastmem fault sites that sit inside a persisted block. Rebind callbacks by fallback-table
+    // key on load (not absolute prelude addr). Sites in HostCall gaps are dropped with the scrub.
     std::unordered_map<u64, FastmemPersist> cb_to_key;
     auto index_fb = [&](u8 kind, const auto& map) {
         for (const auto& [tup, fn] : map) {
@@ -481,6 +471,10 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         if (fault_rip < begin_u || fault_rip >= end_u) {
             continue;
         }
+        const u64 fault_off = fault_rip - begin_u;
+        if (!in_persisted[fault_off]) {
+            continue;
+        }
         if (info.resume_rip < begin_u || info.resume_rip > end_u + 64) {
             continue;
         }
@@ -489,9 +483,18 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
             continue;  // unknown trampoline (e.g. exclusive-read path); skip site
         }
         FastmemPersist e = it->second;
-        e.fault_off = static_cast<s64>(fault_rip - begin_u);
+        e.fault_off = static_cast<s64>(fault_off);
         e.resume_off = static_cast<s64>(info.resume_rip - begin_u);
         fm_entries.push_back(e);
+    }
+
+    // Scrub HostCall / unlisted gaps so a mid-block rel32 into them cannot run ASLR-stale code.
+    // Deferred abort stubs live inside block.size (Emit runs deferred_emits before sizing).
+    std::vector<u8> slab(code_size, 0xCC);
+    for (const auto& e : entries) {
+        const u64 off = static_cast<u64>(static_cast<const u8*>(e.entrypoint) - begin);
+        const u64 sz = std::min(static_cast<u64>(e.size), code_size - off);
+        std::memcpy(slab.data() + off, begin + off, static_cast<size_t>(sz));
     }
 
     FILE* f = std::fopen(path.c_str(), "wb");
@@ -524,6 +527,10 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         reinterpret_cast<u64>(conf.inline_objc_miss_counter);
     hdr.old_bases[static_cast<size_t>(RelocKind::CallbackThis)] =
         reinterpret_cast<u64>(conf.callbacks);
+    // Emitted blocks RIP-load FP/vector immediates from BlockOfCode's ConstantPool (prelude).
+    // A warm process only populates pool slots touched by GenRunCode; Emit slots stay zero and
+    // movi-derived stores (e.g. dyld hash-table mask=1) write 0 → classic warm MAPERR.
+    hdr.const_pool_used = code.GetConstantPoolUsedBytes();
     if (std::fwrite(&hdr, sizeof hdr, 1, f) != 1) {
         std::fclose(f);
         return 0;
@@ -552,13 +559,32 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
             return 0;
         }
     }
-    if (std::fwrite(begin, 1, code_size, f) != code_size) {
+    if (std::fwrite(slab.data(), 1, code_size, f) != code_size) {
         std::fclose(f);
         return 0;
     }
+    if (hdr.const_pool_used) {
+        if (hdr.const_pool_used > code.GetConstantPoolTotalBytes() ||
+            std::fwrite(code.GetConstantPoolData(), 1, hdr.const_pool_used, f) != hdr.const_pool_used) {
+            std::fclose(f);
+            return 0;
+        }
+    }
     std::fclose(f);
+    if (std::getenv("X86CODE_A64_JITCACHE_DEBUG")) {
+        size_t gap = 0;
+        for (bool p : in_persisted) {
+            if (!p) gap++;
+        }
+        std::fprintf(stderr,
+                     "a64jitcache: save blocks=%zu fm=%zu relocs=%zu scrubbed_gap=%zu/%llu const_pool=%llu\n",
+                     entries.size(), fm_entries.size(), relocs.size(), gap,
+                     static_cast<unsigned long long>(code_size),
+                     static_cast<unsigned long long>(hdr.const_pool_used));
+    }
     return static_cast<size_t>(sizeof(PersistHeader) + entries.size() * 24 + relocs.size() * 8 +
-                               fm_entries.size() * sizeof(FastmemPersist) + code_size);
+                               fm_entries.size() * sizeof(FastmemPersist) + code_size +
+                               hdr.const_pool_used);
 }
 
 size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
@@ -682,6 +708,26 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         std::fclose(f);
         return 0;
     }
+    // Restore ConstantPool bytes that persisted blocks RIP-reference (see save comment).
+    if (hdr.const_pool_used) {
+        if (hdr.const_pool_used > code.GetConstantPoolTotalBytes()) {
+            code.DisableWriting();
+            std::fclose(f);
+            return 0;
+        }
+        std::vector<u8> pool_bytes(static_cast<size_t>(hdr.const_pool_used));
+        if (std::fread(pool_bytes.data(), 1, hdr.const_pool_used, f) != hdr.const_pool_used) {
+            code.DisableWriting();
+            std::fclose(f);
+            return 0;
+        }
+        // Pool lives in the writable prelude (allocated before PreludeComplete); safe to fill now.
+        code.RestoreConstantPool(pool_bytes.data(), static_cast<size_t>(hdr.const_pool_used));
+        if (std::getenv("X86CODE_A64_JITCACHE_DEBUG")) {
+            std::fprintf(stderr, "a64jitcache: restored const_pool %llu bytes\n",
+                         static_cast<unsigned long long>(hdr.const_pool_used));
+        }
+    }
     // Apply emitter-recorded relocations against the new bases.
     for (const auto& r : relocs) {
         const size_t ki = static_cast<size_t>(r.kind);
@@ -695,10 +741,16 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         *slot = old_val - old_base + new_base;
     }
     // Restore fastmem fault→fallback map; rebind callbacks to this process's prelude trampolines.
+    // Also rewrite the deferred abort stub's `call rel32` (E8) so the TBI/high-bits slow path
+    // hits the live trampoline even if prelude near/far layout drifted within the same size.
     const u64 new_begin = reinterpret_cast<u64>(begin);
     fastmem_patch_info.clear();
     size_t fm_bound = 0;
+    size_t fm_call_patched = 0;
     for (const auto& fm : fm_entries) {
+        if (fm.fault_off < 0 || static_cast<u64>(fm.fault_off) >= hdr.code_size) {
+            continue;
+        }
         const u64 fault = static_cast<u64>(static_cast<s64>(new_begin) + fm.fault_off);
         const u64 resume = static_cast<u64>(static_cast<s64>(new_begin) + fm.resume_off);
         const auto key = std::make_tuple(fm.ordered != 0, static_cast<size_t>(fm.bitsize),
@@ -719,9 +771,20 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         }
         fastmem_patch_info.emplace(fault, FastmemPatchInfo{resume, reinterpret_cast<u64>(fn)});
         fm_bound++;
+        // Abort stub shape: call wrapped_fn; <resume>. Patch E8 rel32 immediately before resume.
+        if (fm.resume_off >= 5) {
+            u8* call_site = begin + static_cast<size_t>(fm.resume_off) - 5;
+            if (call_site[0] == 0xE8) {
+                const u64 next = reinterpret_cast<u64>(call_site) + 5;
+                const s32 rel = static_cast<s32>(static_cast<s64>(reinterpret_cast<u64>(fn) - next));
+                std::memcpy(call_site + 1, &rel, sizeof(rel));
+                fm_call_patched++;
+            }
+        }
     }
     if (std::getenv("X86CODE_A64_JITCACHE_DEBUG")) {
-        std::fprintf(stderr, "a64jitcache: rebound %zu/%zu fastmem sites\n", fm_bound, fm_entries.size());
+        std::fprintf(stderr, "a64jitcache: rebound %zu/%zu fastmem sites (abort-call patched %zu)\n",
+                     fm_bound, fm_entries.size(), fm_call_patched);
     }
     code.SetCodePtr(begin + hdr.code_size);
     code.DisableWriting();
@@ -730,10 +793,22 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
     size_t loaded = 0;
     persistable_blocks.clear();
     reloc_entries = std::move(relocs);  // keep for a later re-save under the new bases
+    // Optional diagnostic: X86CODE_A64_JITCACHE_SKIP_RANGE=lo-hi skips registering blocks in
+    // [lo, hi) so they retranslate fresh (e.g. to bisect a bad translation).
+    u64 skip_lo = 0, skip_hi = 0;
+    if (const char* sk = std::getenv("X86CODE_A64_JITCACHE_SKIP_RANGE")) {
+        std::sscanf(sk, "%llx-%llx", &skip_lo, &skip_hi);
+    }
+    // block_ranges is for IC invalidation only; cover a single guest insn (4 bytes). Using host
+    // size as a guest PC span (the old bug) made ranges hundreds of bytes wide and could
+    // invalidate / confuse overlapping blocks after IVAU.
     for (const auto& [desc_v, off, sz] : entries) {
         const A64::LocationDescriptor desc{IR::LocationDescriptor{desc_v}};
         const u64 pc = desc.PC();
         if (pc < cache_lo || pc >= cache_hi) {
+            continue;
+        }
+        if (skip_hi && pc >= skip_lo && pc < skip_hi) {
             continue;
         }
         if (off + sz > hdr.code_size) {
@@ -742,7 +817,7 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         CodePtr ep = begin + off;
         BlockDescriptor bd{ep, static_cast<size_t>(sz)};
         block_descriptors.insert({IR::LocationDescriptor{desc_v}, bd});
-        const auto range = boost::icl::discrete_interval<u64>::closed(pc, pc + std::max<u64>(sz, 4) - 1);
+        const auto range = boost::icl::discrete_interval<u64>::closed(pc, pc + 3);
         block_ranges.AddRange(range, desc);
         persistable_blocks.push_back({desc_v, ep, static_cast<size_t>(sz)});
         loaded++;

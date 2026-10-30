@@ -343,13 +343,29 @@ const void* EmitWriteMemoryMov(BlockOfCode& code, const Xbyak::RegExp& addr, int
     return fastmem_location;
 }
 
+// x86Code: with shared translations the running thread's monitor slots come from its A64JitState.
+template<typename UserConfig>
+bool SharedTranslations(const UserConfig& conf) {
+    if constexpr (requires { conf.shared_translations; }) {
+        return conf.shared_translations;
+    } else {
+        return false;
+    }
+}
+
 template<typename UserConfig>
 void EmitExclusiveLock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 pointer, Xbyak::Reg32 tmp) {
     if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
         return;
     }
 
-    code.mov(pointer, mcl::bit_cast<u64>(GetExclusiveMonitorLockPointer(conf.global_monitor)));
+    // x86Code: shared translations load the lock from JitState so the Imm64 is not baked into
+    // persistable blocks (warm ASLR would leave a stale host pointer → MAPERR on ldxr/stxr).
+    if (SharedTranslations(conf)) {
+        code.mov(pointer, qword[r15 + offsetof(A64JitState, excl_lock_ptr)]);
+    } else {
+        code.mov(pointer, mcl::bit_cast<u64>(GetExclusiveMonitorLockPointer(conf.global_monitor)));
+    }
     EmitSpinLockLock(code, pointer, tmp);
 }
 
@@ -359,18 +375,12 @@ void EmitExclusiveUnlock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64
         return;
     }
 
-    code.mov(pointer, mcl::bit_cast<u64>(GetExclusiveMonitorLockPointer(conf.global_monitor)));
-    EmitSpinLockUnlock(code, pointer, tmp);
-}
-
-// x86Code: with shared translations the running thread's monitor slots come from its A64JitState.
-template<typename UserConfig>
-bool SharedTranslations(const UserConfig& conf) {
-    if constexpr (requires { conf.shared_translations; }) {
-        return conf.shared_translations;
+    if (SharedTranslations(conf)) {
+        code.mov(pointer, qword[r15 + offsetof(A64JitState, excl_lock_ptr)]);
     } else {
-        return false;
+        code.mov(pointer, mcl::bit_cast<u64>(GetExclusiveMonitorLockPointer(conf.global_monitor)));
     }
+    EmitSpinLockUnlock(code, pointer, tmp);
 }
 
 template<typename UserConfig>
@@ -392,16 +402,22 @@ void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak:
 
     code.mov(tmp, 0xDEAD'DEAD'DEAD'DEAD);
     const size_t processor_count = GetExclusiveMonitorProcessorCount(conf.global_monitor);
+    const bool shared = SharedTranslations(conf);
     for (size_t processor_index = 0; processor_index < processor_count; processor_index++) {
-        const bool shared = SharedTranslations(conf);
         if (!shared && processor_index == conf.processor_id) {
             continue;
         }
         Xbyak::Label ok;
-        code.mov(pointer, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, processor_index)));
         if (shared) {
+            // Base + index*8 from JitState — no ASLR Imm64 in the persisted slab.
+            code.mov(pointer, qword[r15 + offsetof(A64JitState, excl_addresses_base)]);
+            if (processor_index != 0) {
+                code.add(pointer, static_cast<u32>(processor_index * sizeof(u64)));
+            }
             code.cmp(pointer, qword[r15 + offsetof(A64JitState, excl_address_ptr)]);
             code.je(ok);
+        } else {
+            code.mov(pointer, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, processor_index)));
         }
         code.cmp(qword[pointer], vaddr);
         code.jne(ok);

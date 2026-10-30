@@ -121,6 +121,9 @@ public:
         if (conf.global_monitor) {
             jit_state.excl_address_ptr = GetExclusiveMonitorAddressPointer(conf.global_monitor, thread_conf.processor_id);
             jit_state.excl_value_ptr = GetExclusiveMonitorValuePointer(conf.global_monitor, thread_conf.processor_id);
+            jit_state.excl_lock_ptr =
+                reinterpret_cast<void*>(const_cast<int*>(GetExclusiveMonitorLockPointer(conf.global_monitor)));
+            jit_state.excl_addresses_base = GetExclusiveMonitorAddressPointer(conf.global_monitor, 0);
         }
     }
 
@@ -226,6 +229,8 @@ public:
         fresh.tpidrro_el0_ptr = jit_state.tpidrro_el0_ptr;
         fresh.excl_address_ptr = jit_state.excl_address_ptr;
         fresh.excl_value_ptr = jit_state.excl_value_ptr;
+        fresh.excl_lock_ptr = jit_state.excl_lock_ptr;
+        fresh.excl_addresses_base = jit_state.excl_addresses_base;
         jit_state = fresh;
     }
 

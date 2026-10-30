@@ -80,6 +80,10 @@ struct A64JitState {
     const std::uint64_t* tpidrro_el0_ptr = nullptr;
     void* excl_address_ptr = nullptr;
     void* excl_value_ptr = nullptr;
+    // Shared across threads of one process; still live in JitState so persisted blocks load them
+    // instead of baking ASLR-sensitive Imm64s (warm MAPERR on ldxr/stxr lock word).
+    void* excl_lock_ptr = nullptr;
+    void* excl_addresses_base = nullptr;  // ExclusiveMonitor::exclusive_addresses.data()
 };
 
 #ifdef _MSC_VER

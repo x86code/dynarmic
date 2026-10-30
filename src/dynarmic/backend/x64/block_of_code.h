@@ -134,6 +134,12 @@ public:
     CodePtr GetCodeBegin() const;
     size_t GetTotalCodeSize() const;
 
+    /// x86Code: constant-pool snapshot for persistent JIT cache (RIP targets in prelude).
+    const u8* GetConstantPoolData() const { return constant_pool.Data(); }
+    size_t GetConstantPoolUsedBytes() const { return constant_pool.UsedBytes(); }
+    size_t GetConstantPoolTotalBytes() const { return constant_pool.TotalBytes(); }
+    void RestoreConstantPool(const u8* data, size_t used_bytes) { constant_pool.Restore(data, used_bytes); }
+
     const void* GetReturnFromRunCodeAddress() const {
         return return_from_run_code[0];
     }
