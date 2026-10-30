@@ -386,8 +386,25 @@ private:
         // other threads can still LookupBlock/Emit. A concurrent Invalidate bumps invalidate_gen; if it
         // changed while we translated, discard the IR and retry (the map may already have a fresh block).
         std::unique_lock lock{shared->mutex(), std::defer_lock};
+        // x86Code Speed 8: FastDispatch first (re-entry from the run loop after native calls: ~15% of Preferences went
+        // to the lf_map path), then the lock-free map, then the locked path. Entries are only ever written with the
+        // shared mutex held, which every invalidation also holds: a thread that invalidated code it just wrote can
+        // never find the old block here afterwards (Speed 7's lock-free fill could put one back: iconservicesagent and
+        // Preferences crashes). After a lock-free hit the entry is filled only if the mutex is free (try_lock), from
+        // a lookup under it.
+        const bool fd = conf.shared_translations && fd_fill;
+        if (fd) {
+            if (const CodePtr ep = emitter.FastDispatchProbe(current_location.Value())) {
+                return ep;
+            }
+        }
         if (conf.shared_translations) {
             if (const CodePtr ep = emitter.LookupEntrypoint(current_location)) {
+                if (fd && lock.try_lock()) {
+                    if (const CodePtr now = emitter.LookupEntrypoint(current_location)) {
+                        emitter.FastDispatchFill(current_location.Value(), now);
+                    }
+                }
                 return ep;
             }
         }
@@ -396,8 +413,12 @@ private:
                 lock.lock();
             }
             shared->stats.lookups++;
-            if (auto block = emitter.GetBasicBlock(current_location))
+            if (auto block = emitter.GetBasicBlock(current_location)) {
+                if (fd) {
+                    emitter.FastDispatchFill(current_location.Value(), block->entrypoint);
+                }
                 return block->entrypoint;
+            }
             const u64 gen_at_miss = conf.shared_translations ? shared->invalidate_gen : 0;
             if (conf.shared_translations) {
                 lock.unlock();
@@ -520,6 +541,9 @@ private:
     BlockOfCode& block_of_code;
     A64EmitX64& emitter;
     const Optimization::PolyfillOptions& polyfill_options;
+    // x86Code Speed 8: GetBlock probes/fills FastDispatch (X86CODE_A64_GETBLOCK_FD=1; off by default). Declared after
+    // conf (it reads it).
+    const bool fd_fill = conf.HasOptimization(OptimizationFlag::FastDispatch) && A64EmitX64::GetBlockFillsFastDispatch();
 
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;

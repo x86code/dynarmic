@@ -1316,6 +1316,42 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
     InvalidateBasicBlocks(locations);
 }
 
+namespace {
+__attribute__((target("sse4.2"))) u64 FastDispatchCrc(u64 desc, u64 table) {
+    return _mm_crc32_u64(desc, table);
+}
+}  // namespace
+
+// Same slot as the emitted lookup: crc32(desc, table address) (SSE4.2) & mask, mask in bytes.
+A64EmitX64::FastDispatchEntry* A64EmitX64::FastDispatchSlot(u64 location_descriptor) const {
+    const u64 base = reinterpret_cast<u64>(fast_dispatch_table.data());
+    u64 h = location_descriptor;
+    if (code.HasHostFeature(HostFeature::SSE42)) {
+        h = FastDispatchCrc(location_descriptor, base);
+    }
+    return reinterpret_cast<FastDispatchEntry*>(base + (static_cast<u32>(h) & static_cast<u32>(fast_dispatch_table_mask)));
+}
+
+bool A64EmitX64::GetBlockFillsFastDispatch() {
+    // Off by default: with it on, 2 of 4 cold boots crashed (iconservicesagent free() of a stack address, Preferences
+    // NULL+0x10 next to the Swift conformance step) even though every fill holds the shared mutex. Not yet understood.
+    static const bool on = std::getenv("X86CODE_A64_GETBLOCK_FD") && std::atoi(std::getenv("X86CODE_A64_GETBLOCK_FD")) == 1;
+    return on;
+}
+
+CodePtr A64EmitX64::FastDispatchProbe(u64 location_descriptor) const {
+    const __m128i v = _mm_load_si128(reinterpret_cast<const __m128i*>(FastDispatchSlot(location_descriptor)));
+    if (~static_cast<u64>(_mm_cvtsi128_si64(v)) != location_descriptor) {
+        return nullptr;
+    }
+    return reinterpret_cast<CodePtr>(_mm_extract_epi64(v, 1));
+}
+
+void A64EmitX64::FastDispatchFill(u64 location_descriptor, CodePtr code_ptr) {
+    _mm_store_si128(reinterpret_cast<__m128i*>(FastDispatchSlot(location_descriptor)),
+                    _mm_set_epi64x(static_cast<s64>(reinterpret_cast<u64>(code_ptr)), static_cast<s64>(~location_descriptor)));
+}
+
 void A64EmitX64::ClearFastDispatchTable() {
     if (!conf.HasOptimization(OptimizationFlag::FastDispatch)) {
         return;
@@ -1384,12 +1420,16 @@ void A64EmitX64::GenTerminalHandlers() {
             code.jmp(rax);
             code.L(shared_miss);
             code.LookupBlock();
-            code.not_(rbx);
-            code.movq(xmm0, rbx);
-            code.not_(rbx);
-            code.movq(xmm1, rax);
-            code.punpcklqdq(xmm0, xmm1);
-            code.movdqa(xword[rbp], xmm0);
+            // Speed 8: GetBlock fills the entry, with the shared mutex held; a store here after LookupBlock could put
+            // back a block that another thread invalidated meanwhile.
+            if (!GetBlockFillsFastDispatch()) {
+                code.not_(rbx);
+                code.movq(xmm0, rbx);
+                code.not_(rbx);
+                code.movq(xmm1, rax);
+                code.punpcklqdq(xmm0, xmm1);
+                code.movdqa(xword[rbp], xmm0);
+            }
             code.jmp(rax);
         }
         code.mov(rax, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);

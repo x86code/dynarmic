@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <array>
 #include <map>
 #include <mutex>
@@ -66,6 +68,13 @@ public:
     void ClearCache() override;
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
+
+    /// x86Code Speed 8 (shared translations): GetBlock's FastDispatch probe (one atomic 16-byte read of the entry the
+    /// dispatcher would use) and fill (only with the shared mutex held).
+    CodePtr FastDispatchProbe(u64 location_descriptor) const;
+    void FastDispatchFill(u64 location_descriptor, CodePtr code_ptr);
+    /// X86CODE_A64_GETBLOCK_FD=1: GetBlock probes and fills (else the old way: the dispatcher's miss path fills).
+    static bool GetBlockFillsFastDispatch();
 
     // x86Code: with shared_translations, guards the block map, patch/fastmem info and emission.
     std::recursive_mutex shared_mutex;
@@ -138,6 +147,7 @@ protected:
         return 0xB848u | (A64::LocationDescriptor{target_desc}.PC() << 16);
     }
     void ClearFastDispatchTable();
+    FastDispatchEntry* FastDispatchSlot(u64 location_descriptor) const;
 
     void (*memory_read_128)();
     void (*memory_write_128)();
