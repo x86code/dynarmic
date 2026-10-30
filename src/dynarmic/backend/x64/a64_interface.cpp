@@ -92,8 +92,7 @@ std::shared_ptr<Jit::SharedCode> Jit::MakeSharedCode(UserConfig conf) {
 std::size_t Jit::SavePersistentCache(SharedCode& shared, const std::string& path,
                                      const std::uint8_t cache_uuid[16], std::uint64_t build_id,
                                      std::uint64_t cache_lo, std::uint64_t cache_hi) {
-    std::unique_lock lock{shared.mutex()};
-    return shared.emitter.SavePersistentCache(path, cache_uuid, build_id, cache_lo, cache_hi);
+    return shared.emitter.SavePersistentCache(path, cache_uuid, build_id, cache_lo, cache_hi);  // locks itself
 }
 
 std::size_t Jit::LoadPersistentCache(SharedCode& shared, const std::string& path,

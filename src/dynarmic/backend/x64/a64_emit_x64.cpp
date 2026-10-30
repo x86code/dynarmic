@@ -239,8 +239,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::EmitInlineObjCMsgSend(IR::LocationDescri
     code.mov(r11, r10); // first
 
     code.L(probe_loop);
+    code.mov(rbx, qword[r10 + 8]);  // bsel first: see the LDP note in load_store_register_pair.cpp
     code.mov(rax, qword[r10]);      // stored_imp
-    code.mov(rbx, qword[r10 + 8]);  // bsel
     code.sub(r10, 16);
     code.cmp(rbx, rcx);
     code.je(hit_path, Near);
@@ -256,8 +256,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::EmitInlineObjCMsgSend(IR::LocationDescri
     code.add(r10, r9);
 
     code.L(wrap_loop);
-    code.mov(rax, qword[r10]);
-    code.mov(rbx, qword[r10 + 8]);
+    code.mov(rbx, qword[r10 + 8]);  // bsel first: see the LDP note in load_store_register_pair.cpp
+    code.mov(rax, qword[r10]);      // stored_imp
     code.sub(r10, 16);
     code.cmp(rbx, rcx);
     code.je(hit_path, Near);
@@ -344,7 +344,8 @@ namespace {
 
 // A64JC04: reloc table + fastmem sites with callback rebound by fallback key (not absolute prelude addr).
 // A64JC05: also persist the x86 constant pool (RIP targets from movi/FP immediates).
-constexpr char kPersistMagic[8] = {'A', '6', '4', 'J', 'C', '0', '5', '\0'};
+// A64JC06: block link sites (target, site offset, kind) so loaded blocks are linked, not dispatched (Speed 5).
+constexpr char kPersistMagic[8] = {'A', '6', '4', 'J', 'C', '0', '6', '\0'};
 
 struct PersistHeader {
     char magic[8];
@@ -357,6 +358,14 @@ struct PersistHeader {
     u64 n_fastmem;
     u64 old_bases[static_cast<size_t>(A64EmitX64::RelocKind::Count)];
     u64 const_pool_used;  // bytes of ConstantPool to restore after the code slab
+    u64 n_links;          // LinkPersist records after the fastmem records
+};
+
+struct LinkPersist {
+    u64 target;  // LocationDescriptor of the linked-to block
+    u32 site_off;
+    u8 kind;     // PatchInformation::Kind (JG/JZ/JMP; MOV_RCX sites are not persisted)
+    u8 pad[3]{};
 };
 
 // fault/resume are code_begin-relative; callback is rebound on load via the live fallback table
@@ -388,18 +397,20 @@ void A64EmitX64::EmitMovAbs64(const Xbyak::Reg64& reg, u64 value, RelocKind kind
 
 size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                        u64 cache_lo, u64 cache_hi) {
-    // Unlink every block first. Linked jumps may target HostCall blocks (excluded from the
-    // descriptor list but still present in the slab); those bake ASLR-sensitive absolute
-    // addresses and crash on reload. After unlink, every terminal goes through the dispatcher.
-    code.EnableWriting();
-    for (const auto& [desc, _] : block_descriptors) {
-        Unpatch(desc);
+    // Speed 5: snapshot under the shared lock, write the file after it (periodic saves from a live process must
+    // not stall guest threads for the file write nor unlink their code).
+    std::unique_lock lock{shared_mutex};
+    // Every link site goes to the file in its unlinked form. Linked jumps may target HostCall blocks (excluded from
+    // the descriptor list but still present in the slab); those bake ASLR-sensitive absolute addresses and crash on
+    // reload. With atomic patch sites (shared translations) the unlinked heads are written into the copy below and
+    // the live code stays linked; otherwise every block is unlinked in place first (old behaviour).
+    if (!atomic_patch_sites) {
+        code.EnableWriting();
+        for (const auto& [desc, _] : block_descriptors) {
+            Unpatch(desc);
+        }
+        code.DisableWriting();
     }
-    // Shared mode also stores unlinked heads for atomic patch sites.
-    for (const auto& [site_addr, head] : unlinked_heads) {
-        std::memcpy(reinterpret_cast<void*>(site_addr), &head, 8);
-    }
-    code.DisableWriting();
 
     const u8* begin = static_cast<const u8*>(code.GetCodeBegin());
     const u8* end = code.getCurr<const u8*>();
@@ -500,12 +511,36 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         const u64 sz = std::min(static_cast<u64>(e.size), code_size - off);
         std::memcpy(slab.data() + off, begin + off, static_cast<size_t>(sz));
     }
-
-    FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) {
-        return 0;
+    if (atomic_patch_sites) {
+        for (const auto& [site_addr, head] : unlinked_heads) {
+            if (site_addr >= begin_u && site_addr + 8 <= end_u && in_persisted[site_addr - begin_u]) {
+                std::memcpy(slab.data() + (site_addr - begin_u), &head, 8);
+            }
+        }
     }
+    std::vector<u8> pool(static_cast<size_t>(code.GetConstantPoolUsedBytes()));
+    if (!pool.empty() && pool.size() <= code.GetConstantPoolTotalBytes()) {
+        std::memcpy(pool.data(), code.GetConstantPoolData(), pool.size());
+    }
+
+    std::vector<LinkPersist> links;
+    for (const auto& [target, info] : patch_information) {
+        for (const auto& [kind, site] : info.sites) {
+            const u64 sa = reinterpret_cast<u64>(site);
+            if (kind == PatchInformation::MOV_RCX || sa < begin_u || sa + 8 > end_u || !in_persisted[sa - begin_u]) {
+                continue;
+            }
+            LinkPersist l{};
+            l.target = target.Value();
+            l.site_off = static_cast<u32>(sa - begin_u);
+            l.kind = static_cast<u8>(kind);
+            links.push_back(l);
+        }
+    }
+
+    // header bases (live addresses) are taken under the lock too
     PersistHeader hdr{};
+    hdr.n_links = links.size();
     std::memcpy(hdr.magic, kPersistMagic, 8);
     std::memcpy(hdr.uuid, cache_uuid, 16);
     hdr.build_id = build_id;
@@ -534,7 +569,13 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     // Emitted blocks RIP-load FP/vector immediates from BlockOfCode's ConstantPool (prelude).
     // A warm process only populates pool slots touched by GenRunCode; Emit slots stay zero and
     // movi-derived stores (e.g. dyld hash-table mask=1) write 0 → classic warm MAPERR.
-    hdr.const_pool_used = code.GetConstantPoolUsedBytes();
+    hdr.const_pool_used = pool.size();
+    lock.unlock();
+
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        return 0;
+    }
     if (std::fwrite(&hdr, sizeof hdr, 1, f) != 1) {
         std::fclose(f);
         return 0;
@@ -563,13 +604,16 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
             return 0;
         }
     }
+    if (!links.empty() && std::fwrite(links.data(), sizeof(LinkPersist), links.size(), f) != links.size()) {
+        std::fclose(f);
+        return 0;
+    }
     if (std::fwrite(slab.data(), 1, code_size, f) != code_size) {
         std::fclose(f);
         return 0;
     }
     if (hdr.const_pool_used) {
-        if (hdr.const_pool_used > code.GetConstantPoolTotalBytes() ||
-            std::fwrite(code.GetConstantPoolData(), 1, hdr.const_pool_used, f) != hdr.const_pool_used) {
+        if (std::fwrite(pool.data(), 1, pool.size(), f) != pool.size()) {
             std::fclose(f);
             return 0;
         }
@@ -587,7 +631,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
                      static_cast<unsigned long long>(hdr.const_pool_used));
     }
     return static_cast<size_t>(sizeof(PersistHeader) + entries.size() * 24 + relocs.size() * 8 +
-                               fm_entries.size() * sizeof(FastmemPersist) + code_size +
+                               fm_entries.size() * sizeof(FastmemPersist) + links.size() * sizeof(LinkPersist) + code_size +
                                hdr.const_pool_used);
 }
 
@@ -598,7 +642,13 @@ std::vector<u64> A64EmitX64::ReadPersistentDescriptors(const std::string& path, 
         return out;
     }
     PersistHeader hdr{};
-    if (std::fread(&hdr, sizeof hdr, 1, f) == 1 && std::memcmp(hdr.magic, kPersistMagic, 8) == 0 &&
+    // Hot sets outlive the format: A64JC05 files have the same layout up to n_links (8 bytes shorter header).
+    const bool ok = std::fread(&hdr, sizeof hdr, 1, f) == 1;
+    const bool v5 = ok && std::memcmp(hdr.magic, "A64JC05", 8) == 0;
+    if (v5) {
+        std::fseek(f, static_cast<long>(sizeof hdr - sizeof hdr.n_links), SEEK_SET);
+    }
+    if (ok && (v5 || std::memcmp(hdr.magic, kPersistMagic, 8) == 0) &&
         (build_id == 0 || hdr.build_id == build_id) && std::memcmp(hdr.uuid, cache_uuid, 16) == 0) {
         out.reserve(hdr.n_blocks);
         for (u64 i = 0; i < hdr.n_blocks; i++) {
@@ -691,6 +741,12 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
             std::fclose(f);
             return 0;
         }
+    }
+
+    std::vector<LinkPersist> links(hdr.n_links);
+    if (hdr.n_links && std::fread(links.data(), sizeof(LinkPersist), hdr.n_links, f) != hdr.n_links) {
+        std::fclose(f);
+        return 0;
     }
 
     u64 new_bases[static_cast<size_t>(RelocKind::Count)]{};
@@ -848,6 +904,35 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         block_ranges.AddRange(range, desc);
         persistable_blocks.push_back({desc_v, ep, static_cast<size_t>(sz)});
         loaded++;
+    }
+    // Rebuild link sites (the slab holds every site in its unlinked form) and link callers to loaded blocks.
+    patch_information.clear();
+    unlinked_heads.clear();
+    for (const auto& l : links) {
+        if (static_cast<u64>(l.site_off) + 8 > hdr.code_size || l.kind > PatchInformation::JMP) {
+            continue;
+        }
+        CodePtr site = begin + l.site_off;
+        patch_information[IR::LocationDescriptor{l.target}].add(static_cast<PatchInformation::Kind>(l.kind), site);
+        if (atomic_patch_sites) {
+            u64 head;
+            std::memcpy(&head, site, 8);
+            unlinked_heads[reinterpret_cast<u64>(site)] = head;
+        }
+    }
+    size_t linked = 0;
+    if (!std::getenv("X86CODE_A64_JITCACHE_NOLINK")) {
+        code.EnableWriting();
+        for (const auto& [desc, bd] : block_descriptors) {
+            if (patch_information.count(desc)) {
+                Patch(desc, bd.entrypoint);
+                linked++;
+            }
+        }
+        code.DisableWriting();
+    }
+    if (std::getenv("X86CODE_A64_JITCACHE_DEBUG")) {
+        std::fprintf(stderr, "a64jitcache: %zu link sites, %zu target blocks linked\n", links.size(), linked);
     }
     ClearFastDispatchTable();
     return loaded;
