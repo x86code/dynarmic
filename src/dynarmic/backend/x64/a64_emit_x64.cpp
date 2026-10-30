@@ -834,48 +834,7 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         return 0;
     }
 
-    std::vector<std::tuple<u64, u64, u64>> entries;
-    entries.resize(hdr.n_blocks);
-    for (u64 i = 0; i < hdr.n_blocks; i++) {
-        u64 desc = 0, off = 0, sz = 0;
-        if (std::fread(&desc, 8, 1, f) != 1 || std::fread(&off, 8, 1, f) != 1 || std::fread(&sz, 8, 1, f) != 1) {
-            std::fclose(f);
-            return 0;
-        }
-        entries[i] = {desc, off, sz};
-    }
-
-    std::vector<RelocEntry> relocs;
-    relocs.resize(hdr.n_relocs);
-    for (u64 i = 0; i < hdr.n_relocs; i++) {
-        u32 off = 0;
-        u8 kind = 0;
-        u8 pad[3];
-        if (std::fread(&off, 4, 1, f) != 1 || std::fread(&kind, 1, 1, f) != 1 || std::fread(pad, 1, 3, f) != 3) {
-            std::fclose(f);
-            return 0;
-        }
-        if (kind >= static_cast<u8>(RelocKind::Count) || static_cast<u64>(off) + 8 > hdr.code_size) {
-            std::fclose(f);
-            return 0;
-        }
-        relocs[i] = {off, static_cast<RelocKind>(kind)};
-    }
-
-    std::vector<FastmemPersist> fm_entries;
-    fm_entries.resize(hdr.n_fastmem);
-    for (u64 i = 0; i < hdr.n_fastmem; i++) {
-        if (std::fread(&fm_entries[i], sizeof(FastmemPersist), 1, f) != 1) {
-            std::fclose(f);
-            return 0;
-        }
-    }
-
-    std::vector<LinkPersist> links(hdr.n_links);
-    if (hdr.n_links && std::fread(links.data(), sizeof(LinkPersist), hdr.n_links, f) != hdr.n_links) {
-        std::fclose(f);
-        return 0;
-    }
+    const long data_off = std::ftell(f);
 
     u64 new_bases[static_cast<size_t>(RelocKind::Count)]{};
     new_bases[static_cast<size_t>(RelocKind::CodeBegin)] = reinterpret_cast<u64>(begin);
@@ -978,6 +937,90 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
     }
     // Speed 7: static image metadata (see EmitX64::StaticImage); X86CODE_A64_AOT_LAZY=0 registers every block as before.
     const bool lazy = !map_path.empty() && !(std::getenv("X86CODE_A64_AOT_LAZY") && std::atoi(std::getenv("X86CODE_A64_AOT_LAZY")) == 0);
+    // Speed 10: a published .map + complete .idx for this layout is all a process needs (sorted blocks, links and
+    // fastmem sites; the layout hash in the name pins the fallbacks the index refers to). Every process on the image
+    // used to parse ~1.2M entries, sort them and compare the result with the .idx (~300 ms each, 25+ per boot).
+    // Training (AOT_BUILD / AOT_AUTOSAVE=1) keeps the full parse: a later save needs the reloc table.
+    const bool training = std::getenv("X86CODE_A64_AOT_BUILD") ||
+                          (std::getenv("X86CODE_A64_AOT_AUTOSAVE") && std::atoi(std::getenv("X86CODE_A64_AOT_AUTOSAVE")) == 1);
+    if (mapped && lazy && !training && !(std::getenv("X86CODE_A64_AOT_FASTLOAD") && std::atoi(std::getenv("X86CODE_A64_AOT_FASTLOAD")) == 0)) {
+        fastmem_patch_info.clear();
+        if (MapStaticIndex(map_path + ".idx", begin)) {
+            const u64 skip = hdr.n_blocks * 24 + hdr.n_relocs * 8 + hdr.n_fastmem * sizeof(FastmemPersist) +
+                             hdr.n_links * sizeof(LinkPersist) + hdr.code_size;
+            bool ok = std::fseek(f, data_off + static_cast<long>(skip), SEEK_SET) == 0;
+            if (ok && hdr.const_pool_used) {
+                std::vector<u8> pool_bytes(static_cast<size_t>(hdr.const_pool_used));
+                ok = hdr.const_pool_used <= code.GetConstantPoolTotalBytes() &&
+                     std::fread(pool_bytes.data(), 1, hdr.const_pool_used, f) == hdr.const_pool_used;
+                if (ok) {
+                    code.EnableWriting();
+                    code.RestoreConstantPool(pool_bytes.data(), static_cast<size_t>(hdr.const_pool_used));
+                    code.DisableWriting();
+                }
+            }
+            if (ok) {
+                code.SetCodePtr(begin + hdr.code_size);
+                std::fclose(f);
+                patch_information.clear();
+                ClearFastDispatchTable();
+                SharePrelude(path, reinterpret_cast<u64>(code.getCode()), floor_u);
+                return static_image.n_blocks;
+            }
+            static_image.Reset();  // fall through to the full parse
+            fastmem_patch_info.clear();
+        }
+        std::fseek(f, data_off, SEEK_SET);
+    }
+
+    // one fread per section (it was three per block entry: ~4M calls per process)
+    std::vector<std::tuple<u64, u64, u64>> entries;
+    {
+        std::vector<u64> raw(hdr.n_blocks * 3);
+        if (std::fread(raw.data(), 8, raw.size(), f) != raw.size()) {
+            std::fclose(f);
+            return 0;
+        }
+        entries.resize(hdr.n_blocks);
+        for (u64 i = 0; i < hdr.n_blocks; i++) {
+            entries[i] = {raw[3 * i], raw[3 * i + 1], raw[3 * i + 2]};
+        }
+    }
+
+    std::vector<RelocEntry> relocs;
+    {
+        struct Raw {
+            u32 off;
+            u8 kind, pad[3];
+        };
+        static_assert(sizeof(Raw) == 8);
+        std::vector<Raw> raw(hdr.n_relocs);
+        if (std::fread(raw.data(), sizeof(Raw), raw.size(), f) != raw.size()) {
+            std::fclose(f);
+            return 0;
+        }
+        relocs.resize(hdr.n_relocs);
+        for (u64 i = 0; i < hdr.n_relocs; i++) {
+            if (raw[i].kind >= static_cast<u8>(RelocKind::Count) || static_cast<u64>(raw[i].off) + 8 > hdr.code_size) {
+                std::fclose(f);
+                return 0;
+            }
+            relocs[i] = {raw[i].off, static_cast<RelocKind>(raw[i].kind)};
+        }
+    }
+
+    std::vector<FastmemPersist> fm_entries(hdr.n_fastmem);
+    if (hdr.n_fastmem && std::fread(fm_entries.data(), sizeof(FastmemPersist), hdr.n_fastmem, f) != hdr.n_fastmem) {
+        std::fclose(f);
+        return 0;
+    }
+
+    std::vector<LinkPersist> links(hdr.n_links);
+    if (hdr.n_links && std::fread(links.data(), sizeof(LinkPersist), hdr.n_links, f) != hdr.n_links) {
+        std::fclose(f);
+        return 0;
+    }
+
     std::vector<FastmemTable::StaticEntry> static_fm;
     std::vector<u64> static_cbs;
     code.EnableWriting();
@@ -1027,6 +1070,7 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
     fastmem_patch_info.clear();
     size_t fm_bound = 0;
     size_t fm_call_patched = 0;
+    size_t fm_outside = 0;  // sites not in the static table (the .idx alone is then incomplete)
     for (const auto& fm : fm_entries) {
         if (fm.fault_off < 0 || static_cast<u64>(fm.fault_off) >= hdr.code_size) {
             continue;
@@ -1058,6 +1102,7 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
             static_fm.push_back({static_cast<u32>(fm.fault_off), static_cast<u16>(delta), static_cast<u16>(ci)});
         } else {
             fastmem_patch_info.emplace(fault, FastmemPatchInfo{resume, reinterpret_cast<u64>(fn)});
+            fm_outside++;
         }
         fm_bound++;
         // Abort stub shape: call wrapped_fn; <resume>. Patch E8 rel32 immediately before resume.
@@ -1234,7 +1279,7 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         }
     }
     if (lazy) {
-        PublishStaticIndex(map_path + ".idx", std::move(static_fm), std::move(static_cbs));
+        PublishStaticIndex(map_path + ".idx", std::move(static_fm), std::move(static_cbs), fm_outside == 0);
     }
     ClearFastDispatchTable();
     if (!map_path.empty()) {
@@ -1244,16 +1289,17 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
 }
 
 namespace {
-constexpr char kIndexMagic[8] = {'A', '6', '4', 'I', 'D', 'X', '0', '1'};
+constexpr char kIndexMagic[8] = {'A', '6', '4', 'I', 'D', 'X', '0', '2'};
 struct IndexHeader {
     char magic[8];
     u64 n_blocks, n_links, n_fm, n_cbs;
+    u64 complete;  // Speed 10: every fastmem site is in the static table (MapStaticIndex may skip the image parse)
 };
 }  // namespace
 
 // Speed 7: the first process with a layout writes the static arrays to <map>.idx (published with link(), like the
 // .map); every process maps the file shared and drops its private arrays when the contents match.
-void A64EmitX64::PublishStaticIndex(const std::string& idx_path, std::vector<FastmemTable::StaticEntry> fm, std::vector<u64> cbs) {
+void A64EmitX64::PublishStaticIndex(const std::string& idx_path, std::vector<FastmemTable::StaticEntry> fm, std::vector<u64> cbs, bool complete) {
     static_image.dead.assign((static_image.n_blocks + 63) / 64, 0);
     static_image.live.assign((static_image.n_blocks + 63) / 64, 0);
     static_image.active = true;
@@ -1264,6 +1310,7 @@ void A64EmitX64::PublishStaticIndex(const std::string& idx_path, std::vector<Fas
     h.n_links = static_image.n_links;
     h.n_fm = fm.size();
     h.n_cbs = cbs.size();
+    h.complete = complete;
     const size_t o_cbs = sizeof h, o_blocks = o_cbs + cbs.size() * 8, o_links = o_blocks + h.n_blocks * sizeof(StaticImage::Block),
                  o_fm = o_links + h.n_links * sizeof(StaticImage::Link), len = o_fm + fm.size() * sizeof(FastmemTable::StaticEntry);
     const auto same = [&](const u8* m) {
@@ -1333,6 +1380,43 @@ void A64EmitX64::PublishStaticIndex(const std::string& idx_path, std::vector<Fas
         fastmem_patch_info.SetStatic(reinterpret_cast<u64>(begin), static_fm_own.data(), static_fm_own.size(), std::move(cbs));
     }
     malloc_trim(0);
+}
+
+// Speed 10: adopt a published, complete .idx without the image parse (see LoadPersistentCache). The file was written
+// by a process with this layout (the name's hash), so its callbacks and offsets hold here.
+bool A64EmitX64::MapStaticIndex(const std::string& idx_path, u8* begin) {
+    const int fd = open(idx_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat st {};
+    IndexHeader h{};
+    bool ok = fstat(fd, &st) == 0 && pread(fd, &h, sizeof h, 0) == static_cast<ssize_t>(sizeof h) &&
+              std::memcmp(h.magic, kIndexMagic, 8) == 0 && h.complete == 1;
+    const size_t o_cbs = sizeof h, o_blocks = o_cbs + h.n_cbs * 8, o_links = o_blocks + h.n_blocks * sizeof(StaticImage::Block),
+                 o_fm = o_links + h.n_links * sizeof(StaticImage::Link), len = o_fm + h.n_fm * sizeof(FastmemTable::StaticEntry);
+    ok = ok && static_cast<size_t>(st.st_size) == len;
+    void* m = ok ? mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+    close(fd);
+    if (m == MAP_FAILED) {
+        return false;
+    }
+    const u8* mb = static_cast<const u8*>(m);
+    static_image.Reset();
+    static_image.code_begin = begin;
+    static_image.map = m;
+    static_image.map_len = len;
+    static_image.blocks = reinterpret_cast<const StaticImage::Block*>(mb + o_blocks);
+    static_image.n_blocks = h.n_blocks;
+    static_image.links = reinterpret_cast<const StaticImage::Link*>(mb + o_links);
+    static_image.n_links = h.n_links;
+    static_image.dead.assign((h.n_blocks + 63) / 64, 0);
+    static_image.live.assign((h.n_blocks + 63) / 64, 0);
+    static_image.active = true;
+    std::vector<u64> cbs(h.n_cbs);
+    std::memcpy(cbs.data(), mb + o_cbs, h.n_cbs * 8);
+    fastmem_patch_info.SetStatic(reinterpret_cast<u64>(begin), reinterpret_cast<const FastmemTable::StaticEntry*>(mb + o_fm), h.n_fm, std::move(cbs));
+    return true;
 }
 
 std::string A64EmitX64::MemoryReport() const {
