@@ -19,7 +19,9 @@ ConstantPool::ConstantPool(BlockOfCode& code, size_t size)
     code.int3();
     code.align(align_size);
     pool = std::span<ConstantT>(
-        reinterpret_cast<ConstantT*>(code.AllocateFromCodeSpace(size)), size / align_size);
+        // x86code: the pool is carved from the freshly mapped code space in BlockOfCode's constructor, so it is already
+        // zero; a memset touched all 2 MB in every process (only the used part, tens of KB, is ever written).
+        reinterpret_cast<ConstantT*>(code.AllocateFromCodeSpace(size, false)), size / align_size);
 }
 
 Xbyak::Address ConstantPool::GetConstant(const Xbyak::AddressFrame& frame, u64 lower, u64 upper) {
