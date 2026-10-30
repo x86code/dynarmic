@@ -149,11 +149,15 @@ public:
 
     void EmitVerboseDebuggingOutput();
 
+    /// x86Code: when set, HostCall marks *host_call_flag so A64 persistable-cache can exclude the block.
+    void SetHostCallFlag(bool* flag) { host_call_flag = flag; }
+
 private:
     friend struct Argument;
 
     std::vector<HostLoc> gpr_order;
     std::vector<HostLoc> xmm_order;
+    bool* host_call_flag = nullptr;
 
     HostLoc SelectARegister(const std::vector<HostLoc>& desired_locations) const;
     std::optional<HostLoc> ValueLocation(const IR::Inst* value) const;

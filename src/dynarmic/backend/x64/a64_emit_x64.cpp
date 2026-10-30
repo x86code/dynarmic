@@ -6,8 +6,10 @@
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include <immintrin.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include <fmt/format.h>
@@ -40,7 +42,10 @@ namespace Dynarmic::Backend::X64 {
 using namespace Xbyak::util;
 
 A64EmitContext::A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block)
-        : EmitContext(reg_alloc, block), conf(conf) {}
+        : EmitContext(reg_alloc, block), conf(conf) {
+    // Any HostCall in this block marks it non-persistable (absolute host fn/this embeds).
+    reg_alloc.SetHostCallFlag(&has_host_call);
+}
 
 A64::LocationDescriptor A64EmitContext::Location() const {
     return A64::LocationDescriptor{block.Location()};
@@ -261,7 +266,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::EmitInlineObjCMsgSend(IR::LocationDescri
     code.xor_(rax, rdx);  // imp ^= class
     // Optional counters (conf.inline_objc_hit_counter non-null).
     if (conf.inline_objc_hit_counter) {
-        code.mov(rbx, reinterpret_cast<u64>(conf.inline_objc_hit_counter));
+        EmitMovAbs64(rbx, reinterpret_cast<u64>(conf.inline_objc_hit_counter), RelocKind::ObjcHitCounter);
         code.lock();
         code.inc(qword[rbx]);
     }
@@ -275,7 +280,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::EmitInlineObjCMsgSend(IR::LocationDescri
 
     code.L(miss_path);
     if (conf.inline_objc_miss_counter) {
-        code.mov(rbx, reinterpret_cast<u64>(conf.inline_objc_miss_counter));
+        EmitMovAbs64(rbx, reinterpret_cast<u64>(conf.inline_objc_miss_counter), RelocKind::ObjcMissCounter);
         code.lock();
         code.inc(qword[rbx]);
     }
@@ -291,7 +296,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::EmitInlineObjCMsgSend(IR::LocationDescri
 
     code.L(tagged_path);
     if (conf.inline_objc_miss_counter) {
-        code.mov(rbx, reinterpret_cast<u64>(conf.inline_objc_miss_counter));
+        EmitMovAbs64(rbx, reinterpret_cast<u64>(conf.inline_objc_miss_counter), RelocKind::ObjcMissCounter);
         code.lock();
         code.inc(qword[rbx]);
     }
@@ -332,7 +337,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::EmitInlineObjCMsgSend(IR::LocationDescri
 
 namespace {
 
-constexpr char kPersistMagic[8] = {'A', '6', '4', 'J', 'C', '0', '1', '\0'};
+// A64JC04: reloc table + fastmem sites with callback rebound by fallback key (not absolute prelude addr).
+constexpr char kPersistMagic[8] = {'A', '6', '4', 'J', 'C', '0', '4', '\0'};
 
 struct PersistHeader {
     char magic[8];
@@ -341,9 +347,37 @@ struct PersistHeader {
     u64 code_size;
     u64 n_blocks;
     u64 prelude_size;  // GetCodeBegin() - allocation base; must match on load
+    u64 n_relocs;
+    u64 n_fastmem;
+    u64 old_bases[static_cast<size_t>(A64EmitX64::RelocKind::Count)];
+};
+
+// fault/resume are code_begin-relative; callback is rebound on load via the live fallback table
+// (prelude layout can differ across ASLR near/far call choices even when prelude_size matches).
+struct FastmemPersist {
+    s64 fault_off;
+    s64 resume_off;
+    u8 kind;       // 0=read 1=write 2=exclusive_write
+    u8 ordered;    // 0/1
+    u16 bitsize;   // 8/16/32/64/128
+    u8 vaddr_idx;
+    u8 value_idx;
+    u8 pad[2]{};
 };
 
 }  // namespace
+
+void A64EmitX64::EmitMovAbs64(const Xbyak::Reg64& reg, u64 value, RelocKind kind) {
+    const u8* begin = static_cast<const u8*>(code.GetCodeBegin());
+    const u8* at = code.getCurr<const u8*>();
+    // mov r64, imm64 is 10 bytes: REX.W + B8+r + imm64. Imm starts at +2.
+    // Skip recording while patching an existing site (Unpatch/Patch); the original emit already has an entry.
+    if (!patching && begin && at >= begin) {
+        const u32 imm_off = static_cast<u32>(at - begin) + 2;
+        reloc_entries.push_back({imm_off, kind});
+    }
+    code.mov(reg, value);
+}
 
 size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                        u64 cache_lo, u64 cache_hi) {
@@ -367,6 +401,21 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     }
     const u64 code_size = static_cast<u64>(end - begin);
 
+    const u64 begin_u_early = reinterpret_cast<u64>(begin);
+    const u64 end_u_early = begin_u_early + code_size;
+    // Default: exclude blocks that own a fastmem site. Their abort stubs / vaddr state still
+    // misbehave across reload (warm hello MAPERR at a bogus VA); non-fastmem blocks load and
+    // run correctly (measured). X86CODE_A64_JITCACHE_FASTMEM=1 includes them for further work.
+    const bool drop_fastmem_blocks =
+        !(std::getenv("X86CODE_A64_JITCACHE_FASTMEM") && atoi(std::getenv("X86CODE_A64_JITCACHE_FASTMEM")) == 1);
+    std::vector<bool> fault_in_slab(drop_fastmem_blocks ? code_size : 0);
+    if (drop_fastmem_blocks) {
+        for (const auto& [fault_rip, _] : fastmem_patch_info) {
+            if (fault_rip >= begin_u_early && fault_rip < end_u_early) {
+                fault_in_slab[fault_rip - begin_u_early] = true;
+            }
+        }
+    }
     std::vector<PersistEntry> entries;
     entries.reserve(persistable_blocks.size());
     for (const auto& e : persistable_blocks) {
@@ -379,10 +428,70 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         if (ep < begin || ep >= end) {
             continue;
         }
+        if (drop_fastmem_blocks) {
+            const u64 eoff = reinterpret_cast<u64>(ep) - begin_u_early;
+            bool has_fm = false;
+            for (u64 i = eoff; i < eoff + e.size && i < code_size; i++) {
+                if (fault_in_slab[i]) {
+                    has_fm = true;
+                    break;
+                }
+            }
+            if (has_fm) {
+                continue;
+            }
+        }
         entries.push_back(e);
     }
     if (entries.empty()) {
         return 0;
+    }
+
+    // Drop reloc entries whose Imm64 sits outside the saved slab (prelude / truncated).
+    std::vector<RelocEntry> relocs;
+    relocs.reserve(reloc_entries.size());
+    for (const auto& r : reloc_entries) {
+        if (static_cast<u64>(r.offset) + 8 <= code_size) {
+            relocs.push_back(r);
+        }
+    }
+
+    // Fastmem fault sites: rebind callbacks by fallback-table key on load (not absolute prelude addr).
+    const u64 begin_u = reinterpret_cast<u64>(begin);
+    const u64 end_u = begin_u + code_size;
+    const u64 alloc_u = reinterpret_cast<u64>(code.getCode());
+    std::unordered_map<u64, FastmemPersist> cb_to_key;
+    auto index_fb = [&](u8 kind, const auto& map) {
+        for (const auto& [tup, fn] : map) {
+            FastmemPersist k{};
+            k.kind = kind;
+            k.ordered = static_cast<u8>(std::get<0>(tup));
+            k.bitsize = static_cast<u16>(std::get<1>(tup));
+            k.vaddr_idx = static_cast<u8>(std::get<2>(tup));
+            k.value_idx = static_cast<u8>(std::get<3>(tup));
+            cb_to_key.emplace(reinterpret_cast<u64>(fn), k);
+        }
+    };
+    index_fb(0, read_fallbacks);
+    index_fb(1, write_fallbacks);
+    index_fb(2, exclusive_write_fallbacks);
+    std::vector<FastmemPersist> fm_entries;
+    fm_entries.reserve(fastmem_patch_info.size());
+    for (const auto& [fault_rip, info] : fastmem_patch_info) {
+        if (fault_rip < begin_u || fault_rip >= end_u) {
+            continue;
+        }
+        if (info.resume_rip < begin_u || info.resume_rip > end_u + 64) {
+            continue;
+        }
+        const auto it = cb_to_key.find(info.callback);
+        if (it == cb_to_key.end()) {
+            continue;  // unknown trampoline (e.g. exclusive-read path); skip site
+        }
+        FastmemPersist e = it->second;
+        e.fault_off = static_cast<s64>(fault_rip - begin_u);
+        e.resume_off = static_cast<s64>(info.resume_rip - begin_u);
+        fm_entries.push_back(e);
     }
 
     FILE* f = std::fopen(path.c_str(), "wb");
@@ -395,7 +504,26 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     hdr.build_id = build_id;
     hdr.code_size = code_size;
     hdr.n_blocks = entries.size();
-    hdr.prelude_size = reinterpret_cast<u64>(begin) - reinterpret_cast<u64>(code.getCode());
+    hdr.prelude_size = begin_u - alloc_u;
+    hdr.n_relocs = relocs.size();
+    hdr.n_fastmem = fm_entries.size();
+    hdr.old_bases[static_cast<size_t>(RelocKind::CodeBegin)] = begin_u;
+    hdr.old_bases[static_cast<size_t>(RelocKind::ReturnFromRun)] =
+        reinterpret_cast<u64>(code.GetReturnFromRunCodeAddress());
+    hdr.old_bases[static_cast<size_t>(RelocKind::ForceReturn)] =
+        reinterpret_cast<u64>(code.GetForceReturnFromRunCodeAddress());
+    hdr.old_bases[static_cast<size_t>(RelocKind::TermFastDispatch)] =
+        reinterpret_cast<u64>(terminal_handler_fast_dispatch_hint);
+    hdr.old_bases[static_cast<size_t>(RelocKind::TermPopRSB)] =
+        reinterpret_cast<u64>(terminal_handler_pop_rsb_hint);
+    hdr.old_bases[static_cast<size_t>(RelocKind::FastDispatchTable)] =
+        reinterpret_cast<u64>(fast_dispatch_table.data());
+    hdr.old_bases[static_cast<size_t>(RelocKind::ObjcHitCounter)] =
+        reinterpret_cast<u64>(conf.inline_objc_hit_counter);
+    hdr.old_bases[static_cast<size_t>(RelocKind::ObjcMissCounter)] =
+        reinterpret_cast<u64>(conf.inline_objc_miss_counter);
+    hdr.old_bases[static_cast<size_t>(RelocKind::CallbackThis)] =
+        reinterpret_cast<u64>(conf.callbacks);
     if (std::fwrite(&hdr, sizeof hdr, 1, f) != 1) {
         std::fclose(f);
         return 0;
@@ -409,12 +537,28 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
             return 0;
         }
     }
+    for (const auto& r : relocs) {
+        const u32 off = r.offset;
+        const u8 kind = static_cast<u8>(r.kind);
+        if (std::fwrite(&off, 4, 1, f) != 1 || std::fwrite(&kind, 1, 1, f) != 1 ||
+            std::fwrite("\0\0\0", 1, 3, f) != 3) {
+            std::fclose(f);
+            return 0;
+        }
+    }
+    for (const auto& fm : fm_entries) {
+        if (std::fwrite(&fm, sizeof fm, 1, f) != 1) {
+            std::fclose(f);
+            return 0;
+        }
+    }
     if (std::fwrite(begin, 1, code_size, f) != code_size) {
         std::fclose(f);
         return 0;
     }
     std::fclose(f);
-    return static_cast<size_t>(sizeof(PersistHeader) + entries.size() * 24 + code_size);
+    return static_cast<size_t>(sizeof(PersistHeader) + entries.size() * 24 + relocs.size() * 8 +
+                               fm_entries.size() * sizeof(FastmemPersist) + code_size);
 }
 
 size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
@@ -436,8 +580,23 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
     u8* begin = const_cast<u8*>(static_cast<const u8*>(code.GetCodeBegin()));
     const u64 prelude_size = reinterpret_cast<u64>(begin) - reinterpret_cast<u64>(code.getCode());
     if (hdr.prelude_size != prelude_size) {
+        std::fprintf(stderr,
+                     "a64jitcache: prelude_size mismatch saved=%llu live=%llu (near/far call layout?)\n",
+                     static_cast<unsigned long long>(hdr.prelude_size),
+                     static_cast<unsigned long long>(prelude_size));
         std::fclose(f);
         return 0;
+    }
+    if (std::getenv("X86CODE_A64_JITCACHE_DEBUG")) {
+        std::fprintf(stderr,
+                     "a64jitcache: load begin old=%#llx new=%#llx ret old=%#llx new=%#llx prelude=%llu relocs=%llu fastmem=%llu\n",
+                     static_cast<unsigned long long>(hdr.old_bases[static_cast<size_t>(RelocKind::CodeBegin)]),
+                     static_cast<unsigned long long>(reinterpret_cast<u64>(begin)),
+                     static_cast<unsigned long long>(hdr.old_bases[static_cast<size_t>(RelocKind::ReturnFromRun)]),
+                     static_cast<unsigned long long>(reinterpret_cast<u64>(code.GetReturnFromRunCodeAddress())),
+                     static_cast<unsigned long long>(prelude_size),
+                     static_cast<unsigned long long>(hdr.n_relocs),
+                     static_cast<unsigned long long>(hdr.n_fastmem));
     }
     if (hdr.code_size == 0 || hdr.code_size > code.SpaceRemaining()) {
         std::fclose(f);
@@ -455,11 +614,114 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         entries[i] = {desc, off, sz};
     }
 
+    std::vector<RelocEntry> relocs;
+    relocs.resize(hdr.n_relocs);
+    for (u64 i = 0; i < hdr.n_relocs; i++) {
+        u32 off = 0;
+        u8 kind = 0;
+        u8 pad[3];
+        if (std::fread(&off, 4, 1, f) != 1 || std::fread(&kind, 1, 1, f) != 1 || std::fread(pad, 1, 3, f) != 3) {
+            std::fclose(f);
+            return 0;
+        }
+        if (kind >= static_cast<u8>(RelocKind::Count) || static_cast<u64>(off) + 8 > hdr.code_size) {
+            std::fclose(f);
+            return 0;
+        }
+        relocs[i] = {off, static_cast<RelocKind>(kind)};
+    }
+
+    std::vector<FastmemPersist> fm_entries;
+    fm_entries.resize(hdr.n_fastmem);
+    for (u64 i = 0; i < hdr.n_fastmem; i++) {
+        if (std::fread(&fm_entries[i], sizeof(FastmemPersist), 1, f) != 1) {
+            std::fclose(f);
+            return 0;
+        }
+    }
+
+    u64 new_bases[static_cast<size_t>(RelocKind::Count)]{};
+    new_bases[static_cast<size_t>(RelocKind::CodeBegin)] = reinterpret_cast<u64>(begin);
+    new_bases[static_cast<size_t>(RelocKind::ReturnFromRun)] =
+        reinterpret_cast<u64>(code.GetReturnFromRunCodeAddress());
+    new_bases[static_cast<size_t>(RelocKind::ForceReturn)] =
+        reinterpret_cast<u64>(code.GetForceReturnFromRunCodeAddress());
+    new_bases[static_cast<size_t>(RelocKind::TermFastDispatch)] =
+        reinterpret_cast<u64>(terminal_handler_fast_dispatch_hint);
+    new_bases[static_cast<size_t>(RelocKind::TermPopRSB)] =
+        reinterpret_cast<u64>(terminal_handler_pop_rsb_hint);
+    new_bases[static_cast<size_t>(RelocKind::FastDispatchTable)] =
+        reinterpret_cast<u64>(fast_dispatch_table.data());
+    new_bases[static_cast<size_t>(RelocKind::ObjcHitCounter)] =
+        reinterpret_cast<u64>(conf.inline_objc_hit_counter);
+    new_bases[static_cast<size_t>(RelocKind::ObjcMissCounter)] =
+        reinterpret_cast<u64>(conf.inline_objc_miss_counter);
+    new_bases[static_cast<size_t>(RelocKind::CallbackThis)] =
+        reinterpret_cast<u64>(conf.callbacks);
+
+    // Refuse kinds we cannot relocate (old base was set, new base is null, or vice versa for counters/callback).
+    for (size_t k = 0; k < static_cast<size_t>(RelocKind::Count); k++) {
+        const bool old_set = hdr.old_bases[k] != 0;
+        const bool new_set = new_bases[k] != 0;
+        if (old_set != new_set) {
+            // Terminal handlers / FD table / code begin must always be present when used.
+            if (k <= static_cast<size_t>(RelocKind::FastDispatchTable) ||
+                k == static_cast<size_t>(RelocKind::CallbackThis)) {
+                std::fclose(f);
+                return 0;
+            }
+            // Objc counters: allow both-null; if only one side has them, refuse.
+            std::fclose(f);
+            return 0;
+        }
+    }
+
     code.EnableWriting();
     if (std::fread(begin, 1, hdr.code_size, f) != hdr.code_size) {
         code.DisableWriting();
         std::fclose(f);
         return 0;
+    }
+    // Apply emitter-recorded relocations against the new bases.
+    for (const auto& r : relocs) {
+        const size_t ki = static_cast<size_t>(r.kind);
+        const u64 old_base = hdr.old_bases[ki];
+        const u64 new_base = new_bases[ki];
+        if (old_base == 0 && new_base == 0) {
+            continue;
+        }
+        u64* slot = reinterpret_cast<u64*>(begin + r.offset);
+        const u64 old_val = *slot;
+        *slot = old_val - old_base + new_base;
+    }
+    // Restore fastmem fault→fallback map; rebind callbacks to this process's prelude trampolines.
+    const u64 new_begin = reinterpret_cast<u64>(begin);
+    fastmem_patch_info.clear();
+    size_t fm_bound = 0;
+    for (const auto& fm : fm_entries) {
+        const u64 fault = static_cast<u64>(static_cast<s64>(new_begin) + fm.fault_off);
+        const u64 resume = static_cast<u64>(static_cast<s64>(new_begin) + fm.resume_off);
+        const auto key = std::make_tuple(fm.ordered != 0, static_cast<size_t>(fm.bitsize),
+                                         static_cast<int>(fm.vaddr_idx), static_cast<int>(fm.value_idx));
+        void (*fn)() = nullptr;
+        if (fm.kind == 0) {
+            const auto it = read_fallbacks.find(key);
+            if (it != read_fallbacks.end()) fn = it->second;
+        } else if (fm.kind == 1) {
+            const auto it = write_fallbacks.find(key);
+            if (it != write_fallbacks.end()) fn = it->second;
+        } else if (fm.kind == 2) {
+            const auto it = exclusive_write_fallbacks.find(key);
+            if (it != exclusive_write_fallbacks.end()) fn = it->second;
+        }
+        if (!fn) {
+            continue;
+        }
+        fastmem_patch_info.emplace(fault, FastmemPatchInfo{resume, reinterpret_cast<u64>(fn)});
+        fm_bound++;
+    }
+    if (std::getenv("X86CODE_A64_JITCACHE_DEBUG")) {
+        std::fprintf(stderr, "a64jitcache: rebound %zu/%zu fastmem sites\n", fm_bound, fm_entries.size());
     }
     code.SetCodePtr(begin + hdr.code_size);
     code.DisableWriting();
@@ -467,6 +729,7 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
 
     size_t loaded = 0;
     persistable_blocks.clear();
+    reloc_entries = std::move(relocs);  // keep for a later re-save under the new bases
     for (const auto& [desc_v, off, sz] : entries) {
         const A64::LocationDescriptor desc{IR::LocationDescriptor{desc_v}};
         const u64 pc = desc.PC();
@@ -496,6 +759,7 @@ void A64EmitX64::ClearCache() {
     fastmem_recompile_markers.clear();
     unlinked_heads.clear();
     persistable_blocks.clear();
+    reloc_entries.clear();
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
@@ -554,6 +818,7 @@ void A64EmitX64::GenTerminalHandlers() {
         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
         calculate_location_descriptor();
         code.L(rsb_cache_miss);
+        // Prelude (before GetCodeBegin): not in the persistent slab; no reloc entry needed.
         code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table.data()));
         code.mov(rbp, rbx);
         if (code.HasHostFeature(HostFeature::SSE42)) {
@@ -1231,7 +1496,13 @@ void A64EmitX64::EmitPatchMovRcx(CodePtr target_code_ptr) {
         __atomic_store_n(reinterpret_cast<u64*>(reinterpret_cast<u64>(patch_location) + 2), reinterpret_cast<u64>(target_code_ptr), __ATOMIC_RELEASE);
         return;
     }
-    code.mov(code.rcx, reinterpret_cast<u64>(target_code_ptr));
+    // Absolute code pointer: block entry (CodeBegin-relative) or ReturnFromRunCode.
+    const RelocKind kind = (target_code_ptr == code.GetReturnFromRunCodeAddress())
+                               ? RelocKind::ReturnFromRun
+                               : (target_code_ptr == code.GetForceReturnFromRunCodeAddress())
+                                     ? RelocKind::ForceReturn
+                                     : RelocKind::CodeBegin;
+    EmitMovAbs64(code.rcx, reinterpret_cast<u64>(target_code_ptr), kind);
     code.EnsurePatchLocationSize(patch_location, 10);
     ASSERT(!conf.shared_translations || (code.getCurr<const u8*>() - static_cast<const u8*>(patch_location) == 10 && ((reinterpret_cast<u64>(patch_location) + 2) & 7) == 0));
 }

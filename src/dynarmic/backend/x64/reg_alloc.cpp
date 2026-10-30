@@ -435,6 +435,10 @@ void RegAlloc::HostCall(IR::Inst* result_def,
                         std::optional<Argument::copyable_reference> arg1,
                         std::optional<Argument::copyable_reference> arg2,
                         std::optional<Argument::copyable_reference> arg3) {
+    // x86Code: mark the A64 block non-persistable (HostCall embeds ASLR-sensitive host pointers).
+    if (host_call_flag) {
+        *host_call_flag = true;
+    }
     constexpr size_t args_count = 4;
     constexpr std::array<HostLoc, args_count> args_hostloc = {ABI_PARAM1, ABI_PARAM2, ABI_PARAM3, ABI_PARAM4};
     const std::array<std::optional<Argument::copyable_reference>, args_count> args = {arg0, arg1, arg2, arg3};

@@ -73,6 +73,29 @@ public:
     };
     std::vector<PersistEntry> persistable_blocks;
 
+    /// x86Code: emitter-recorded relocation for absolute host Imm64 embeds (AOT stage 4 precursor).
+    /// On load: *(u64*)(code_begin + offset) += new_base[kind] - old_base[kind].
+    enum class RelocKind : u8 {
+        CodeBegin = 0,          // JIT translated-code slab (GetCodeBegin)
+        ReturnFromRun = 1,      // dispatcher leave
+        ForceReturn = 2,
+        TermFastDispatch = 3,   // terminal_handler_fast_dispatch_hint
+        TermPopRSB = 4,
+        FastDispatchTable = 5,  // fast_dispatch_table.data()
+        ObjcHitCounter = 6,
+        ObjcMissCounter = 7,
+        CallbackThis = 8,       // conf.callbacks
+        Count = 9,
+    };
+    struct RelocEntry {
+        u32 offset;  // byte offset from GetCodeBegin()
+        RelocKind kind;
+    };
+    std::vector<RelocEntry> reloc_entries;
+
+    /// Emit `mov reg, Imm64(value)` and record a reloc when value is relative to `kind`.
+    void EmitMovAbs64(const Xbyak::Reg64& reg, u64 value, RelocKind kind);
+
 protected:
     const A64::UserConfig conf;
     A64::Jit* jit_interface;
