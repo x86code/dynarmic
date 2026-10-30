@@ -34,6 +34,8 @@ public:
         std::uint64_t blocks = 0, guest_instructions = 0, code_bytes = 0, translate_ns = 0, lookups = 0;
     };
     static SharedStats GetSharedStats(const SharedCode& shared);
+    /// x86Code: host memory held by the shared emitter's maps (memlog; takes the shared lock).
+    static std::string GetMemoryReport(SharedCode& shared);
     /// x86Code: dump translated blocks whose guest PC is in [cache_lo, cache_hi) to path.
     /// Keyed by cache_uuid (16 bytes) + build_id. Returns bytes written, or 0 on failure.
     static std::size_t SavePersistentCache(SharedCode& shared, const std::string& path,

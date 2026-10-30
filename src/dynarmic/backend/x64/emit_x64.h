@@ -76,7 +76,8 @@ class EmitX64 {
 public:
     struct BlockDescriptor {
         CodePtr entrypoint;  // Entrypoint of emitted code
-        size_t size;         // Length in bytes of emitted code
+        u32 size;            // Length in bytes of emitted code
+        u32 persistable = 0; // x86Code: no host calls, may go to the persistent cache (was a separate vector)
     };
 
     explicit EmitX64(BlockOfCode& code);
@@ -131,8 +132,46 @@ protected:
     // With ~1M pending link targets that cut the robin_map bucket array ~224 MB → ~80 MB.
     struct PatchInformation {
         enum Kind : u8 { JG = 0, JZ = 1, JMP = 2, MOV_RCX = 3 };
-        std::vector<std::pair<Kind, CodePtr>> sites;
-        void add(Kind k, CodePtr p) { sites.emplace_back(k, p); }
+    };
+    // x86Code (Speed 6): link sites per target as singly linked lists in one pool: a robin_map target -> head (index+1)
+    // and 12 bytes per site (site pointer tagged with the kind in its top bits, next index). Was a robin_map of
+    // std::vector (40 B buckets for every block ever registered, since Patch() used operator[]): SpringBoard 195 MB.
+    class PatchTable {
+    public:
+        void Add(const IR::LocationDescriptor& target, PatchInformation::Kind kind, CodePtr site) {
+            u32& head = heads[target.Value()];
+            sites.push_back(reinterpret_cast<u64>(site) | (static_cast<u64>(kind) << 62));
+            next.push_back(head);
+            head = static_cast<u32>(sites.size());
+        }
+        bool count(const IR::LocationDescriptor& target) const { return heads.count(target.Value()) != 0; }
+        template<typename F>
+        void ForEachSite(const IR::LocationDescriptor& target, F&& f) const {
+            const auto it = heads.find(target.Value());
+            for (u32 i = it == heads.end() ? 0 : it->second; i; i = next[i - 1]) {
+                f(static_cast<PatchInformation::Kind>(sites[i - 1] >> 62), reinterpret_cast<CodePtr>(sites[i - 1] & ~(u64(3) << 62)));
+            }
+        }
+        template<typename F>
+        void ForEach(F&& f) const {
+            for (const auto& [target, head] : heads) {
+                for (u32 i = head; i; i = next[i - 1]) {
+                    f(target, static_cast<PatchInformation::Kind>(sites[i - 1] >> 62), reinterpret_cast<CodePtr>(sites[i - 1] & ~(u64(3) << 62)));
+                }
+            }
+        }
+        void clear() {
+            heads.clear();
+            sites.clear();
+            next.clear();
+        }
+        size_t size() const { return heads.size(); }
+        size_t MemoryBytes() const { return heads.bucket_count() * 24 + sites.capacity() * 8 + next.capacity() * 4; }
+
+    private:
+        tsl::robin_map<u64, u32> heads;
+        std::vector<u64> sites;
+        std::vector<u32> next;
     };
     void Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
     // x86Code: shared translations. Patch sites are aligned so a link/unlink is one atomic 8-byte store (other threads
@@ -179,10 +218,11 @@ protected:
         }
         void Set(u64 k, CodePtr c);
         void Clear();
+        size_t MemoryBytes() const { return (table.load()->mask + 1) * sizeof(Entry); }
         static Table* Alloc(size_t n);
         static void Insert(Table* t, u64 k, CodePtr c);
     } lf_map;
-    tsl::robin_map<IR::LocationDescriptor, PatchInformation> patch_information;
+    PatchTable patch_information;
 };
 
 }  // namespace Dynarmic::Backend::X64

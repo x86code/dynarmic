@@ -169,7 +169,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     auto bd = RegisterBlock(descriptor, entrypoint, size);
     // Track persistable blocks (no host calls; PC filter applied at save time).
     if (!ctx.has_host_call && !ctx.IsSingleStep()) {
-        persistable_blocks.push_back({descriptor.UniqueHash(), entrypoint, size});
+        block_descriptors.find(descriptor).value().persistable = 1;
+        bd.persistable = 1;
     }
     return bd;
 }
@@ -336,7 +337,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::EmitInlineObjCMsgSend(IR::LocationDescri
     block_ranges.AddRange(range, descriptor);
     PerfMapRegister(entrypoint, code.getCurr(), "a64_inline_objc_msgSend");
     auto bd = RegisterBlock(descriptor, entrypoint, size);
-    persistable_blocks.push_back({descriptor.UniqueHash(), entrypoint, size});
+    block_descriptors.find(descriptor).value().persistable = 1;
     return bd;
 }
 
@@ -428,9 +429,13 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     // their bytes remain in the slab — scrub those gaps to int3 below so a stray rel32 cannot
     // execute stale absolute Imm64s (warm MAPERR root cause).
     std::vector<PersistEntry> entries;
-    entries.reserve(persistable_blocks.size());
+    entries.reserve(block_descriptors.size());
     std::vector<bool> in_persisted(code_size, false);
-    for (const auto& e : persistable_blocks) {
+    for (const auto& [loc, bd] : block_descriptors) {
+        if (!bd.persistable) {
+            continue;
+        }
+        const PersistEntry e{loc.Value(), bd.entrypoint, bd.size};
         const A64::LocationDescriptor desc{IR::LocationDescriptor{e.location_descriptor}};
         const u64 pc = desc.PC();
         if (pc < cache_lo || pc >= cache_hi) {
@@ -482,26 +487,26 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     index_fb(2, exclusive_write_fallbacks);
     std::vector<FastmemPersist> fm_entries;
     fm_entries.reserve(fastmem_patch_info.size());
-    for (const auto& [fault_rip, info] : fastmem_patch_info) {
+    fastmem_patch_info.ForEach([&](u64 fault_rip, const FastmemPatchInfo& info) {
         if (fault_rip < begin_u || fault_rip >= end_u) {
-            continue;
+            return;
         }
         const u64 fault_off = fault_rip - begin_u;
         if (!in_persisted[fault_off]) {
-            continue;
+            return;
         }
         if (info.resume_rip < begin_u || info.resume_rip > end_u + 64) {
-            continue;
+            return;
         }
         const auto it = cb_to_key.find(info.callback);
         if (it == cb_to_key.end()) {
-            continue;  // unknown trampoline (e.g. exclusive-read path); skip site
+            return;  // unknown trampoline (e.g. exclusive-read path); skip site
         }
         FastmemPersist e = it->second;
         e.fault_off = static_cast<s64>(fault_off);
         e.resume_off = static_cast<s64>(info.resume_rip - begin_u);
         fm_entries.push_back(e);
-    }
+    });
 
     // Scrub HostCall / unlisted gaps so a mid-block rel32 into them cannot run ASLR-stale code.
     // Deferred abort stubs live inside block.size (Emit runs deferred_emits before sizing).
@@ -512,11 +517,13 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         std::memcpy(slab.data() + off, begin + off, static_cast<size_t>(sz));
     }
     if (atomic_patch_sites) {
-        for (const auto& [site_addr, head] : unlinked_heads) {
-            if (site_addr >= begin_u && site_addr + 8 <= end_u && in_persisted[site_addr - begin_u]) {
+        patch_information.ForEach([&](u64 target, PatchInformation::Kind kind, CodePtr site) {
+            const u64 site_addr = reinterpret_cast<u64>(site);
+            if (kind != PatchInformation::MOV_RCX && site_addr >= begin_u && site_addr + 8 <= end_u && in_persisted[site_addr - begin_u]) {
+                const u64 head = UnlinkedHead(IR::LocationDescriptor{target});
                 std::memcpy(slab.data() + (site_addr - begin_u), &head, 8);
             }
-        }
+        });
     }
     std::vector<u8> pool(static_cast<size_t>(code.GetConstantPoolUsedBytes()));
     if (!pool.empty() && pool.size() <= code.GetConstantPoolTotalBytes()) {
@@ -524,19 +531,17 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     }
 
     std::vector<LinkPersist> links;
-    for (const auto& [target, info] : patch_information) {
-        for (const auto& [kind, site] : info.sites) {
-            const u64 sa = reinterpret_cast<u64>(site);
-            if (kind == PatchInformation::MOV_RCX || sa < begin_u || sa + 8 > end_u || !in_persisted[sa - begin_u]) {
-                continue;
-            }
-            LinkPersist l{};
-            l.target = target.Value();
-            l.site_off = static_cast<u32>(sa - begin_u);
-            l.kind = static_cast<u8>(kind);
-            links.push_back(l);
+    patch_information.ForEach([&](u64 target, PatchInformation::Kind kind, CodePtr site) {
+        const u64 sa = reinterpret_cast<u64>(site);
+        if (kind == PatchInformation::MOV_RCX || sa < begin_u || sa + 8 > end_u || !in_persisted[sa - begin_u]) {
+            return;
         }
-    }
+        LinkPersist l{};
+        l.target = target;
+        l.site_off = static_cast<u32>(sa - begin_u);
+        l.kind = static_cast<u8>(kind);
+        links.push_back(l);
+    });
 
     // header bases (live addresses) are taken under the lock too
     PersistHeader hdr{};
@@ -874,7 +879,6 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
     std::fclose(f);
 
     size_t loaded = 0;
-    persistable_blocks.clear();
     reloc_entries = std::move(relocs);  // keep for a later re-save under the new bases
     // Optional diagnostic: X86CODE_A64_JITCACHE_SKIP_RANGE=lo-hi skips registering blocks in
     // [lo, hi) so they retranslate fresh (e.g. to bisect a bad translation).
@@ -898,29 +902,22 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
             continue;
         }
         CodePtr ep = begin + off;
-        BlockDescriptor bd{ep, static_cast<size_t>(sz)};
+        BlockDescriptor bd{ep, static_cast<u32>(sz), 1};
         if (block_descriptors.insert({IR::LocationDescriptor{desc_v}, bd}).second) {
             lf_map.Set(desc_v, ep);
         }
         const auto range = boost::icl::discrete_interval<u64>::closed(pc, pc + 3);
         block_ranges.AddRange(range, desc);
-        persistable_blocks.push_back({desc_v, ep, static_cast<size_t>(sz)});
         loaded++;
     }
     // Rebuild link sites (the slab holds every site in its unlinked form) and link callers to loaded blocks.
     patch_information.clear();
-    unlinked_heads.clear();
     for (const auto& l : links) {
         if (static_cast<u64>(l.site_off) + 8 > hdr.code_size || l.kind > PatchInformation::JMP) {
             continue;
         }
         CodePtr site = begin + l.site_off;
-        patch_information[IR::LocationDescriptor{l.target}].add(static_cast<PatchInformation::Kind>(l.kind), site);
-        if (atomic_patch_sites) {
-            u64 head;
-            std::memcpy(&head, site, 8);
-            unlinked_heads[reinterpret_cast<u64>(site)] = head;
-        }
+        patch_information.Add(IR::LocationDescriptor{l.target}, static_cast<PatchInformation::Kind>(l.kind), site);
     }
     size_t linked = 0;
     if (!std::getenv("X86CODE_A64_JITCACHE_NOLINK")) {
@@ -940,14 +937,26 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
     return loaded;
 }
 
+std::string A64EmitX64::MemoryReport() const {
+    const auto mb = [](double b) { return b / 1048576.0; };
+    char buf[512];
+    std::snprintf(buf, sizeof buf,
+                  "block_descriptors %.1f (%zu) patch_information %.1f (%zu) block_ranges %.1f fastmem %.1f (%zu) "
+                  "relocs %.1f lf_map %.1f",
+                  mb(block_descriptors.bucket_count() * (sizeof(IR::LocationDescriptor) + sizeof(BlockDescriptor) + 8)), block_descriptors.size(),
+                  mb(patch_information.MemoryBytes()), patch_information.size(),
+                  mb(block_ranges.MemoryBytes()),
+                  mb(fastmem_patch_info.MemoryBytes()), fastmem_patch_info.size(),
+                  mb(reloc_entries.capacity() * sizeof(RelocEntry)), mb(lf_map.MemoryBytes()));
+    return buf;
+}
+
 void A64EmitX64::ClearCache() {
     EmitX64::ClearCache();
     block_ranges.ClearCache();
     ClearFastDispatchTable();
     fastmem_patch_info.clear();
     fastmem_recompile_markers.clear();
-    unlinked_heads.clear();
-    persistable_blocks.clear();
     reloc_entries.clear();
 }
 
@@ -1465,7 +1474,7 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
         if (conf.shared_translations) {
             code.align(8);
         }
-        patch_information[terminal.next].add(PatchInformation::JG, code.getCurr());
+        patch_information.Add(terminal.next, PatchInformation::JG, code.getCurr());
         if (const auto next_bb = GetBasicBlock(terminal.next)) {
             EmitPatchJg(terminal.next, next_bb->entrypoint);
         } else {
@@ -1477,7 +1486,7 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
         if (conf.shared_translations) {
             code.align(8);
         }
-        patch_information[terminal.next].add(PatchInformation::JZ, code.getCurr());
+        patch_information.Add(terminal.next, PatchInformation::JZ, code.getCurr());
         if (const auto next_bb = GetBasicBlock(terminal.next)) {
             EmitPatchJz(terminal.next, next_bb->entrypoint);
         } else {
@@ -1501,7 +1510,7 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
     if (conf.shared_translations) {
         code.align(8);
     }
-    patch_information[terminal.next].add(PatchInformation::JMP, code.getCurr());
+    patch_information.Add(terminal.next, PatchInformation::JMP, code.getCurr());
     if (auto next_bb = GetBasicBlock(terminal.next)) {
         EmitPatchJmp(terminal.next, next_bb->entrypoint);
     } else {
@@ -1561,12 +1570,12 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::CheckHalt terminal, IR::LocationDesc
 // jcc/jmp dispatcher; 23/22 bytes) and starts 8-byte aligned. Linking replaces only the first 8 bytes, atomically:
 // `jcc rel32; jmp short <site end>` or `jmp rel32`. A thread inside the site sees either head, and the tail it may
 // be executing never changes. kind: 0 jg, 1 jz, 2 jmp.
-void A64EmitX64::WriteSharedLinkHead(int kind, CodePtr site, CodePtr target_code_ptr) {
+void A64EmitX64::WriteSharedLinkHead(int kind, CodePtr site, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const u64 site_addr = reinterpret_cast<u64>(site);
     ASSERT((site_addr & 7) == 0);
     u64 head;
     if (!target_code_ptr) {
-        head = unlinked_heads.at(site_addr);
+        head = UnlinkedHead(target_desc);
     } else {
         u8 bytes[8];
         std::memcpy(bytes, site, 8);
@@ -1592,7 +1601,7 @@ void A64EmitX64::WriteSharedLinkHead(int kind, CodePtr site, CodePtr target_code
 void A64EmitX64::EmitSharedPatchSite(int kind, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const CodePtr site = code.getCurr();
     if (patching) {
-        WriteSharedLinkHead(kind, site, target_code_ptr);
+        WriteSharedLinkHead(kind, site, target_desc, target_code_ptr);
         return;
     }
     // always the 10-byte `mov rax, imm64` (48 B8 imm64): no instruction may start inside the 8-byte head
@@ -1610,9 +1619,9 @@ void A64EmitX64::EmitSharedPatchSite(int kind, const IR::LocationDescriptor& tar
     code.EnsurePatchLocationSize(site, kind == 2 ? 22 : 23);
     u64 head;
     std::memcpy(&head, site, 8);
-    unlinked_heads[reinterpret_cast<u64>(site)] = head;
+    ASSERT(head == UnlinkedHead(target_desc));
     if (target_code_ptr) {
-        WriteSharedLinkHead(kind, site, target_code_ptr);
+        WriteSharedLinkHead(kind, site, target_desc, target_code_ptr);
     }
 }
 

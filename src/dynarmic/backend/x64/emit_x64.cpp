@@ -174,7 +174,7 @@ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, I
             code.nop(8 - misalign);
         }
     }
-    patch_information[target].add(PatchInformation::MOV_RCX, code.getCurr());
+    patch_information.Add(target, PatchInformation::MOV_RCX, code.getCurr());
     EmitPatchMovRcx(target_code_ptr);
 
     code.mov(qword[r15 + index_reg * 8 + code.GetJitStateInfo().offsetof_rsb_location_descriptors], loc_desc_reg);
@@ -424,7 +424,7 @@ EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& de
     PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
     Patch(descriptor, entrypoint);
 
-    BlockDescriptor block_desc{entrypoint, size};
+    BlockDescriptor block_desc{entrypoint, static_cast<u32>(size)};
     block_descriptors.insert({IR::LocationDescriptor{descriptor.Value()}, block_desc});
     lf_map.Set(descriptor.Value(), entrypoint);
     return block_desc;
@@ -443,10 +443,9 @@ void EmitX64::EmitTerminal(IR::Terminal terminal, IR::LocationDescriptor initial
 
 void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const CodePtr save_code_ptr = code.getCurr();
-    const PatchInformation& patch_info = patch_information[target_desc];
     patching = true;
 
-    for (const auto& [kind, location] : patch_info.sites) {
+    patch_information.ForEachSite(target_desc, [&](PatchInformation::Kind kind, CodePtr location) {
         code.SetCodePtr(location);
         switch (kind) {
         case PatchInformation::JG:
@@ -462,7 +461,7 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
             EmitPatchMovRcx(target_code_ptr);
             break;
         }
-    }
+    });
 
     patching = false;
     code.SetCodePtr(save_code_ptr);

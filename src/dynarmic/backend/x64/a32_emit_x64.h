@@ -15,6 +15,7 @@
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a32_jitstate.h"
 #include "dynarmic/backend/x64/emit_x64.h"
+#include "dynarmic/backend/x64/fastmem_table.h"
 #include "dynarmic/frontend/A32/a32_location_descriptor.h"
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
@@ -99,11 +100,7 @@ protected:
     // Fastmem information
     using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
     // x86Code: see a64_emit_x64.h — slim fastmem_patch_info, markers in a side map.
-    struct FastmemPatchInfo {
-        u64 resume_rip;
-        u64 callback;
-    };
-    tsl::robin_map<u64, FastmemPatchInfo> fastmem_patch_info;
+    FastmemTable fastmem_patch_info;
     tsl::robin_map<u64, DoNotFastmemMarker> fastmem_recompile_markers;
     std::set<DoNotFastmemMarker> do_not_fastmem;
     std::optional<DoNotFastmemMarker> ShouldFastmem(A32EmitContext& ctx, IR::Inst* inst) const;

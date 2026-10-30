@@ -27,9 +27,9 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
 }
 
 FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
-    const auto iter = fastmem_patch_info.find(rip_);
+    const FastmemPatchInfo* iter = fastmem_patch_info.Lookup(rip_);
 
-    if (iter == fastmem_patch_info.end()) {
+    if (!iter) {
         fmt::print("dynarmic: Segfault happened within JITted code at rip = {:016x}\n", rip_);
         fmt::print("Segfault wasn't at a fastmem patch location!\n");
         fmt::print("Now dumping code.......\n\n");
@@ -38,8 +38,8 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
     }
 
     FakeCall result{
-        .call_rip = iter->second.callback,
-        .ret_rip = iter->second.resume_rip,
+        .call_rip = iter->callback,
+        .ret_rip = iter->resume_rip,
     };
 
     if (const auto mit = fastmem_recompile_markers.find(rip_); mit != fastmem_recompile_markers.end()) {

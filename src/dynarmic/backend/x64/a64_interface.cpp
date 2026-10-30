@@ -84,6 +84,11 @@ Jit::SharedStats Jit::GetSharedStats(const SharedCode& shared) {
     return shared.stats;
 }
 
+std::string Jit::GetMemoryReport(SharedCode& shared) {
+    std::unique_lock lock{shared.mutex()};
+    return shared.emitter.MemoryReport();
+}
+
 std::shared_ptr<Jit::SharedCode> Jit::MakeSharedCode(UserConfig conf) {
     ASSERT(conf.shared_translations);
     return std::make_shared<SharedCode>(conf);

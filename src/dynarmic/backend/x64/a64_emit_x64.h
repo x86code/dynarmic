@@ -14,6 +14,7 @@
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/emit_x64.h"
+#include "dynarmic/backend/x64/fastmem_table.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 #include "dynarmic/interface/A64/a64.h"
 #include "dynarmic/interface/A64/config.h"
@@ -72,7 +73,8 @@ public:
         CodePtr entrypoint;
         size_t size;
     };
-    std::vector<PersistEntry> persistable_blocks;
+    /// x86Code: approximate host bytes held by the emitter's maps, one "name MB" list for memlog.
+    std::string MemoryReport() const;
 
     /// x86Code: emitter-recorded relocation for absolute host Imm64 embeds (AOT stage 4 precursor).
     /// On load: *(u64*)(code_begin + offset) += new_base[kind] - old_base[kind].
@@ -113,9 +115,13 @@ protected:
     static constexpr size_t fast_dispatch_table_size = 0x40000;
     alignas(16) std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;  // 16-byte atomic entries when shared
     // x86Code shared translations: original first 8 bytes of each unlinked jg/jz/jmp patch site
-    tsl::robin_map<u64, u64> unlinked_heads;
     void EmitSharedPatchSite(int kind, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
-    void WriteSharedLinkHead(int kind, CodePtr site, CodePtr target_code_ptr);
+    void WriteSharedLinkHead(int kind, CodePtr site, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
+    // The first 8 bytes of an unlinked site: `mov rax, imm64` (48 B8) and the low 6 bytes of the target PC
+    // (x86Code Speed 6: computed instead of kept in a site -> head map, 48 MB for SpringBoard).
+    static u64 UnlinkedHead(const IR::LocationDescriptor& target_desc) {
+        return 0xB848u | (A64::LocationDescriptor{target_desc}.PC() << 16);
+    }
     void ClearFastDispatchTable();
 
     void (*memory_read_128)();
@@ -151,11 +157,7 @@ protected:
     // x86Code: keep the fault→fallback map to two u64s. The marker/recompile flag live in a
     // side map that stays empty when recompile_on_fastmem_failure is false (our default),
     // shrinking ~1.5M-entry bucket storage from ~224 MB (56 B/entry) to ~128 MB (32 B/entry).
-    struct FastmemPatchInfo {
-        u64 resume_rip;
-        u64 callback;
-    };
-    tsl::robin_map<u64, FastmemPatchInfo> fastmem_patch_info;
+    FastmemTable fastmem_patch_info;
     tsl::robin_map<u64, DoNotFastmemMarker> fastmem_recompile_markers;
     std::set<DoNotFastmemMarker> do_not_fastmem;
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
