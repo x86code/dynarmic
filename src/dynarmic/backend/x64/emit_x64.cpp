@@ -92,7 +92,9 @@ void EmitX64::LockFreeBlockMap::Set(u64 k, CodePtr c) {
             if (e == k || e == 0) return;
         }
     }
-    if ((used + 1) * 2 > t->mask + 1) {
+    // x86Code (Speed 10): grow at 75% load (was 50%: the table sat 25-50% full, SpringBoard's at 32 MB). Linear
+    // probing at 75% costs ~2.5 probes per hit, ~8 per miss; misses go on to translate anyway.
+    if ((used + 1) * 4 > (t->mask + 1) * 3) {
         const size_t n = (t->mask + 1) * 2;
         Table* nt = Alloc(n);
         used = 0;

@@ -205,7 +205,7 @@ protected:
             u64 pad;
             Entry e[1];
         };
-        // Grows by doubling at 50% load; the old table is published away, then zeroed with MADV_DONTNEED (kept
+        // Grows by doubling at 75% load; the old table is published away, then zeroed with MADV_DONTNEED (kept
         // mapped), so a reader still probing it sees empty keys = miss.
         std::atomic<Table*> table{nullptr};
         size_t used = 0;
