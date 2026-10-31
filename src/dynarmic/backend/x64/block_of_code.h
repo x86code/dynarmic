@@ -151,6 +151,7 @@ public:
     size_t GetConstantPoolUsedBytes() const { return constant_pool.UsedBytes(); }
     size_t GetConstantPoolTotalBytes() const { return constant_pool.TotalBytes(); }
     void RestoreConstantPool(const u8* data, size_t used_bytes) { constant_pool.Restore(data, used_bytes); }
+    void SetConstantPoolInsertionOffset(size_t bytes) { constant_pool.SetInsertionOffset(bytes); }
 
     const void* GetReturnFromRunCodeAddress() const {
         return return_from_run_code[0];

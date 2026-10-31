@@ -1,3 +1,4 @@
+#include <sys/mman.h>
 /* This file is part of the dynarmic project.
  * Copyright (c) 2016 MerryMage
  * SPDX-License-Identifier: 0BSD
@@ -148,6 +149,13 @@ public:
 
     void Pretranslate(u64 location_descriptor) {
         GetBlock(IR::LocationDescriptor{location_descriptor});
+    }
+    bool PretranslateCollect(u64 location_descriptor, std::vector<u64>& successors) {
+        const u64 before = shared ? shared->stats.blocks : 0;
+        emitter.aot_successors = &successors;
+        GetBlock(IR::LocationDescriptor{location_descriptor});
+        emitter.aot_successors = nullptr;
+        return !shared || shared->stats.blocks != before;
     }
 
     HaltReason Run() {
@@ -618,6 +626,55 @@ Jit::~Jit() = default;
 
 void Jit::Pretranslate(std::uint64_t location_descriptor) {
     impl->Pretranslate(location_descriptor);
+}
+
+bool Jit::PretranslateCollect(std::uint64_t location_descriptor, std::vector<std::uint64_t>& successors) {
+    return impl->PretranslateCollect(location_descriptor, successors);
+}
+
+void Jit::BeginChunk(SharedCode& shared, std::uint64_t code_off) {
+    shared.emitter.BeginChunk(code_off);
+}
+
+std::uint64_t Jit::ChunkCodeEnd(SharedCode& shared) {
+    std::unique_lock lock{shared.mutex()};
+    return static_cast<std::uint64_t>(shared.block_of_code.getCurr<const std::uint8_t*>() -
+                                      static_cast<const std::uint8_t*>(shared.block_of_code.GetCodeBegin()));
+}
+
+std::uint64_t Jit::CodeCapacity(SharedCode& shared) {
+    std::unique_lock lock{shared.mutex()};
+    return static_cast<std::uint64_t>(shared.block_of_code.getCurr<const std::uint8_t*>() -
+                                      static_cast<const std::uint8_t*>(shared.block_of_code.GetCodeBegin())) +
+           shared.block_of_code.SpaceRemaining();
+}
+
+void Jit::DiscardCode(SharedCode& shared, std::uint64_t from_off, std::uint64_t to_off) {
+    std::unique_lock lock{shared.mutex()};
+    auto* b = static_cast<std::uint8_t*>(const_cast<void*>(shared.block_of_code.GetCodeBegin()));
+    const std::uint64_t lo = (reinterpret_cast<std::uint64_t>(b + from_off) + 4095) & ~4095ull;
+    const std::uint64_t hi = reinterpret_cast<std::uint64_t>(b + to_off) & ~4095ull;
+    if (hi > lo) {
+        madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
+    }
+}
+
+std::size_t Jit::SaveChunk(SharedCode& shared, const std::string& path, const std::uint8_t cache_uuid[16], std::uint64_t build_id,
+                           std::uint64_t cache_lo, std::uint64_t cache_hi, std::uint64_t code_off) {
+    return shared.emitter.SaveChunk(path, cache_uuid, build_id, cache_lo, cache_hi, code_off);
+}
+
+void Jit::SetConstantPoolRegion(SharedCode& shared, const std::vector<std::uint8_t>& pool, std::size_t region_off) {
+    shared.emitter.SetConstantPoolRegion(pool, region_off);
+}
+
+std::size_t Jit::ConstantPoolUsed(SharedCode& shared) {
+    std::unique_lock lock{shared.mutex()};
+    return shared.block_of_code.GetConstantPoolUsedBytes();
+}
+
+std::vector<std::uint8_t> Jit::ReadPersistentPool(const std::string& path) {
+    return A64EmitX64::ReadPersistentPool(path);
 }
 
 std::vector<std::uint64_t> Jit::ReadPersistentDescriptors(const std::string& path, const std::uint8_t cache_uuid[16],

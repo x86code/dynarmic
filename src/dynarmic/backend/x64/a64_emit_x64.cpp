@@ -115,9 +115,38 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 
 A64EmitX64::~A64EmitX64() = default;
 
+namespace {
+// x86Code Speed 18: direct successors of a block (static AOT discovery follows them).
+void CollectSuccessors(const IR::Terminal& t, std::vector<u64>& out) {
+    if (const auto* lb = boost::get<IR::Term::LinkBlock>(&t)) {
+        out.push_back(lb->next.Value());
+    } else if (const auto* lf = boost::get<IR::Term::LinkBlockFast>(&t)) {
+        out.push_back(lf->next.Value());
+    } else if (const auto* in = boost::get<IR::Term::Interpret>(&t)) {
+        out.push_back(in->next.Value());
+    } else if (const auto* i = boost::get<IR::Term::If>(&t)) {
+        CollectSuccessors(i->then_, out);
+        CollectSuccessors(i->else_, out);
+    } else if (const auto* c = boost::get<IR::Term::CheckBit>(&t)) {
+        CollectSuccessors(c->then_, out);
+        CollectSuccessors(c->else_, out);
+    } else if (const auto* h = boost::get<IR::Term::CheckHalt>(&t)) {
+        CollectSuccessors(h->else_, out);
+    }
+}
+}  // namespace
+
 A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     if (conf.very_verbose_debugging_output) {
         std::puts(IR::DumpBlock(block).c_str());
+    }
+    if (aot_successors) {
+        CollectSuccessors(block.GetTerminal(), *aot_successors);
+        for (const auto& inst : block) {
+            if (inst.GetOpcode() == IR::Opcode::PushRSB && inst.GetArg(0).IsImmediate()) {
+                aot_successors->push_back(inst.GetArg(0).GetU64());
+            }
+        }
     }
 
     code.EnableWriting();
@@ -382,6 +411,9 @@ namespace {
 // A64JC05: also persist the x86 constant pool (RIP targets from movi/FP immediates).
 // A64JC06: block link sites (target, site offset, kind) so loaded blocks are linked, not dispatched (Speed 5).
 constexpr char kPersistMagic[8] = {'A', '6', '4', 'J', 'C', '0', '6', '\0'};
+// x86Code Speed 18: one chunk (library / executable) of a chunked AOT image, see SaveChunk / AssembleChunks.
+constexpr char kChunkMagic[8] = {'A', '6', '4', 'C', 'K', '0', '1', '\0'};
+constexpr u64 kWholeSlab = ~0ull;
 
 struct PersistHeader {
     char magic[8];
@@ -433,6 +465,15 @@ void A64EmitX64::EmitMovAbs64(const Xbyak::Reg64& reg, u64 value, RelocKind kind
 
 size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                        u64 cache_lo, u64 cache_hi) {
+    return SaveChunk(path, cache_uuid, build_id, cache_lo, cache_hi, kWholeSlab);
+}
+
+// x86Code Speed 18: code_off == kWholeSlab saves the whole slab (A64JC06); otherwise only blocks from code_off on, as
+// an A64CK01 chunk (header, then u64 code_off, then the same sections; the code section holds [code_off, code_size)).
+size_t A64EmitX64::SaveChunk(const std::string& path, const u8 cache_uuid[16], u64 build_id,
+                             u64 cache_lo, u64 cache_hi, u64 code_off) {
+    const bool chunk = code_off != kWholeSlab;
+    const u64 base_off = chunk ? code_off : 0;
     // Speed 5: snapshot under the shared lock, write the file after it (periodic saves from a live process must
     // not stall guest threads for the file write nor unlink their code).
     std::unique_lock lock{shared_mutex};
@@ -454,6 +495,9 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         return 0;
     }
     const u64 code_size = static_cast<u64>(end - begin);
+    if (base_off >= code_size) {
+        return 0;
+    }
 
     const u64 begin_u = reinterpret_cast<u64>(begin);
     const u64 end_u = begin_u + code_size;
@@ -465,7 +509,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     // execute stale absolute Imm64s (warm MAPERR root cause).
     std::vector<PersistEntry> entries;
     entries.reserve(block_descriptors.size());
-    std::vector<bool> in_persisted(code_size, false);
+    std::vector<bool> in_persisted(code_size - base_off, false);
     // Speed 7: registered static blocks live only in lf_map + the live bitset
     std::vector<std::pair<IR::LocationDescriptor, BlockDescriptor>> all_blocks(block_descriptors.begin(), block_descriptors.end());
     for (size_t i = 0; static_image.active && i < static_image.n_blocks; i++) {
@@ -489,12 +533,12 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
             continue;
         }
         const u64 eoff = reinterpret_cast<u64>(ep) - begin_u;
-        if (eoff >= code_size) {
+        if (eoff >= code_size || eoff < base_off) {
             continue;
         }
         const u64 eend = std::min(eoff + static_cast<u64>(e.size), code_size);
         for (u64 i = eoff; i < eend; i++) {
-            in_persisted[i] = true;
+            in_persisted[i - base_off] = true;
         }
         entries.push_back(e);
     }
@@ -506,7 +550,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     std::vector<RelocEntry> relocs;
     relocs.reserve(reloc_entries.size());
     for (const auto& r : reloc_entries) {
-        if (static_cast<u64>(r.offset) + 8 <= code_size) {
+        if (static_cast<u64>(r.offset) + 8 <= code_size && r.offset >= base_off) {
             relocs.push_back(r);
         }
     }
@@ -535,7 +579,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
             return;
         }
         const u64 fault_off = fault_rip - begin_u;
-        if (!in_persisted[fault_off]) {
+        if (fault_off < base_off || !in_persisted[fault_off - base_off]) {
             return;
         }
         if (info.resume_rip < begin_u || info.resume_rip > end_u + 64) {
@@ -563,18 +607,18 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
 
     // Scrub HostCall / unlisted gaps so a mid-block rel32 into them cannot run ASLR-stale code.
     // Deferred abort stubs live inside block.size (Emit runs deferred_emits before sizing).
-    std::vector<u8> slab(code_size, 0xCC);
+    std::vector<u8> slab(code_size - base_off, 0xCC);
     for (const auto& e : entries) {
         const u64 off = static_cast<u64>(static_cast<const u8*>(e.entrypoint) - begin);
         const u64 sz = std::min(static_cast<u64>(e.size), code_size - off);
-        std::memcpy(slab.data() + off, begin + off, static_cast<size_t>(sz));
+        std::memcpy(slab.data() + (off - base_off), begin + off, static_cast<size_t>(sz));
     }
     if (atomic_patch_sites) {
         for_each_site([&](u64 target, PatchInformation::Kind kind, CodePtr site) {
             const u64 site_addr = reinterpret_cast<u64>(site);
-            if (kind != PatchInformation::MOV_RCX && site_addr >= begin_u && site_addr + 8 <= end_u && in_persisted[site_addr - begin_u]) {
+            if (kind != PatchInformation::MOV_RCX && site_addr >= begin_u + base_off && site_addr + 8 <= end_u && in_persisted[site_addr - begin_u - base_off]) {
                 const u64 head = UnlinkedHead(IR::LocationDescriptor{target});
-                std::memcpy(slab.data() + (site_addr - begin_u), &head, 8);
+                std::memcpy(slab.data() + (site_addr - begin_u - base_off), &head, 8);
             }
         });
     }
@@ -586,7 +630,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     std::vector<LinkPersist> links;
     for_each_site([&](u64 target, PatchInformation::Kind kind, CodePtr site) {
         const u64 sa = reinterpret_cast<u64>(site);
-        if (kind == PatchInformation::MOV_RCX || sa < begin_u || sa + 8 > end_u || !in_persisted[sa - begin_u]) {
+        if (kind == PatchInformation::MOV_RCX || sa < begin_u + base_off || sa + 8 > end_u || !in_persisted[sa - begin_u - base_off]) {
             return;
         }
         LinkPersist l{};
@@ -599,7 +643,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     // header bases (live addresses) are taken under the lock too
     PersistHeader hdr{};
     hdr.n_links = links.size();
-    std::memcpy(hdr.magic, kPersistMagic, 8);
+    std::memcpy(hdr.magic, chunk ? kChunkMagic : kPersistMagic, 8);
     std::memcpy(hdr.uuid, cache_uuid, 16);
     hdr.build_id = build_id;
     hdr.code_size = code_size;
@@ -634,7 +678,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
     if (!f) {
         return 0;
     }
-    if (std::fwrite(&hdr, sizeof hdr, 1, f) != 1) {
+    if (std::fwrite(&hdr, sizeof hdr, 1, f) != 1 || (chunk && std::fwrite(&base_off, 8, 1, f) != 1)) {
         std::fclose(f);
         return 0;
     }
@@ -666,7 +710,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
         std::fclose(f);
         return 0;
     }
-    if (std::fwrite(slab.data(), 1, code_size, f) != code_size) {
+    if (std::fwrite(slab.data(), 1, slab.size(), f) != slab.size()) {
         std::fclose(f);
         return 0;
     }
@@ -689,7 +733,7 @@ size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_u
                      static_cast<unsigned long long>(hdr.const_pool_used));
     }
     return static_cast<size_t>(sizeof(PersistHeader) + entries.size() * 24 + relocs.size() * 8 +
-                               fm_entries.size() * sizeof(FastmemPersist) + links.size() * sizeof(LinkPersist) + code_size +
+                               fm_entries.size() * sizeof(FastmemPersist) + links.size() * sizeof(LinkPersist) + slab.size() +
                                hdr.const_pool_used);
 }
 
@@ -716,6 +760,78 @@ std::vector<u64> A64EmitX64::ReadPersistentDescriptors(const std::string& path, 
                 break;
             }
             out.push_back(e[0]);
+        }
+    }
+    std::fclose(f);
+    return out;
+}
+
+void A64EmitX64::BeginChunk(u64 code_off) {
+    std::unique_lock lock{shared_mutex};
+    ClearCache();
+    code.SetCodePtr(static_cast<const u8*>(code.GetCodeBegin()) + code_off);
+}
+
+void A64EmitX64::SetConstantPoolRegion(const std::vector<u8>& pool, size_t region_off) {
+    std::unique_lock lock{shared_mutex};
+    code.EnableWriting();
+    const size_t n = std::min(pool.size(), code.GetConstantPoolTotalBytes()) & ~size_t{15};
+    if (n) {
+        // keep the slots this process's prelude already filled (GenRunCode): the union only adds to them
+        std::vector<u8> merged(pool.begin(), pool.begin() + n);
+        const u8* live = code.GetConstantPoolData();
+        const size_t live_n = std::min(code.GetConstantPoolUsedBytes(), n);
+        for (size_t i = 0; i < live_n; i += 16) {
+            static const u8 zero[16]{};
+            if (std::memcmp(live + i, zero, 16) != 0) {
+                std::memcpy(merged.data() + i, live + i, 16);
+            }
+        }
+        code.RestoreConstantPool(merged.data(), n);
+    }
+    code.SetConstantPoolInsertionOffset(region_off);
+    code.DisableWriting();
+}
+
+namespace {
+struct FileView {
+    PersistHeader hdr{};
+    u64 code_off = 0;  // chunk files
+    bool chunk = false;
+    long data_off = 0;  // after the header (and code_off)
+    u64 SlabLen() const { return hdr.code_size - code_off; }
+    long PoolOff() const {
+        return data_off + static_cast<long>(hdr.n_blocks * 24 + hdr.n_relocs * 8 + hdr.n_fastmem * sizeof(FastmemPersist) +
+                                            hdr.n_links * sizeof(LinkPersist) + SlabLen());
+    }
+};
+bool ReadView(FILE* f, FileView& v) {
+    if (std::fread(&v.hdr, sizeof v.hdr, 1, f) != 1) {
+        return false;
+    }
+    v.chunk = std::memcmp(v.hdr.magic, kChunkMagic, 8) == 0;
+    if (!v.chunk && std::memcmp(v.hdr.magic, kPersistMagic, 8) != 0) {
+        return false;
+    }
+    if (v.chunk && (std::fread(&v.code_off, 8, 1, f) != 1 || v.code_off > v.hdr.code_size)) {
+        return false;
+    }
+    v.data_off = std::ftell(f);
+    return true;
+}
+}  // namespace
+
+std::vector<u8> A64EmitX64::ReadPersistentPool(const std::string& path) {
+    std::vector<u8> out;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        return out;
+    }
+    FileView v;
+    if (ReadView(f, v) && v.hdr.const_pool_used && std::fseek(f, v.PoolOff(), SEEK_SET) == 0) {
+        out.resize(v.hdr.const_pool_used);
+        if (std::fread(out.data(), 1, out.size(), f) != out.size()) {
+            out.clear();
         }
     }
     std::fclose(f);

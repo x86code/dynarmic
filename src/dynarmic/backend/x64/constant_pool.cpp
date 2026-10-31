@@ -51,7 +51,9 @@ void ConstantPool::Restore(const u8* data, size_t used_bytes) {
     }
     // Rebuild the lookup map from restored slots so later GetConstant reuses them.
     constant_info.clear();
+    // x86Code Speed 18: all-zero slots may be gaps of a merged pool (another builder's region): not reused.
     for (size_t i = 0; i < insertion_point; i++) {
+        if (pool[i].first == 0 && pool[i].second == 0) continue;
         constant_info.insert({pool[i], &pool[i]});
     }
 }

@@ -64,6 +64,17 @@ public:
     size_t LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                u64 cache_lo, u64 cache_hi, bool shared_image = false);
     static std::vector<u64> ReadPersistentDescriptors(const std::string& path, const u8 cache_uuid[16], u64 build_id);
+    /// x86Code Speed 18 (chunked AOT image): when set, Emit appends the block's direct successors (link targets, call
+    /// return addresses) here, so a static builder can follow them.
+    std::vector<u64>* aot_successors = nullptr;
+    /// Save only the code from code_off on (one chunk's slot) as an "A64CK01" chunk file; offsets stay slab-absolute.
+    size_t SaveChunk(const std::string& path, const u8 cache_uuid[16], u64 build_id, u64 cache_lo, u64 cache_hi, u64 code_off);
+    /// Start a chunk: drop every registered block and emit from code_off on.
+    void BeginChunk(u64 code_off);
+    /// Constant pool bytes of a chunk or image file (empty on failure).
+    static std::vector<u8> ReadPersistentPool(const std::string& path);
+    /// Restore the union pool and put new constants from byte offset region_off on (parallel builders: disjoint regions).
+    void SetConstantPoolRegion(const std::vector<u8>& pool, size_t region_off);
 
     void ClearCache() override;
 

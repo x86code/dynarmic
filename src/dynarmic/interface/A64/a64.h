@@ -56,6 +56,24 @@ public:
                                                                 std::uint64_t build_id);
     /// x86Code: AOT. Translate the block at a location descriptor without running it.
     void Pretranslate(std::uint64_t location_descriptor);
+
+    /// x86Code Speed 18 (chunked AOT image). Translate a block and append its direct successors (link targets, call
+    /// return addresses); false if it was already translated.
+    bool PretranslateCollect(std::uint64_t location_descriptor, std::vector<std::uint64_t>& successors);
+    /// Drop every registered block and emit from this offset (from the code begin) on.
+    static void BeginChunk(SharedCode& shared, std::uint64_t code_off);
+    /// Current emit offset from the code begin; total slab capacity.
+    static std::uint64_t ChunkCodeEnd(SharedCode& shared);
+    static std::uint64_t CodeCapacity(SharedCode& shared);
+    /// Release the pages of [from_off, to_off) (a saved chunk).
+    static void DiscardCode(SharedCode& shared, std::uint64_t from_off, std::uint64_t to_off);
+    /// Save the blocks emitted from code_off on as a chunk file. Returns bytes written.
+    static std::size_t SaveChunk(SharedCode& shared, const std::string& path, const std::uint8_t cache_uuid[16],
+                                 std::uint64_t build_id, std::uint64_t cache_lo, std::uint64_t cache_hi, std::uint64_t code_off);
+    /// Restore a merged constant pool; new constants go from byte offset region_off on.
+    static void SetConstantPoolRegion(SharedCode& shared, const std::vector<std::uint8_t>& pool, std::size_t region_off);
+    static std::size_t ConstantPoolUsed(SharedCode& shared);
+    static std::vector<std::uint8_t> ReadPersistentPool(const std::string& path);
     ~Jit();
 
     /**

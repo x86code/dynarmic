@@ -35,6 +35,8 @@ public:
     size_t UsedBytes() const { return insertion_point * align_size; }
     /// Overwrite pool[0..used) and bump insertion_point so later GetConstant won't clobber.
     void Restore(const u8* data, size_t used_bytes);
+    /// x86Code Speed 18: put the next new constant at this byte offset (never backwards).
+    void SetInsertionOffset(size_t bytes) { if (bytes / align_size > insertion_point) insertion_point = bytes / align_size; }
 
 private:
     static constexpr size_t align_size = 16;  // bytes
