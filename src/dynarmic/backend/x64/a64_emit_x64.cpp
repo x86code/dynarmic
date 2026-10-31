@@ -1356,12 +1356,31 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         if (wfd >= 0) {
             const u64 len = end_u64 - floor_u;
             u64 done = 0;
+            // x86Code Speed 19: all-zero 64 KB pieces (slot headroom, ~40% of the image) become holes: a sparse file
+            // that reads back the same
+            constexpr u64 kPiece = 64 * 1024;
+            static const u8 kZero[kPiece] = {};
+            bool tail_hole = false;
             while (done < len) {
-                const ssize_t n = write(wfd, reinterpret_cast<const u8*>(floor_u) + done, len - done);
+                const u64 want = std::min(kPiece, len - done);
+                const u8* src = reinterpret_cast<const u8*>(floor_u) + done;
+                if (want == kPiece && std::memcmp(src, kZero, kPiece) == 0) {
+                    if (lseek(wfd, static_cast<off_t>(kPiece), SEEK_CUR) < 0) {
+                        break;
+                    }
+                    done += kPiece;
+                    tail_hole = true;
+                    continue;
+                }
+                const ssize_t n = write(wfd, src, want);
                 if (n <= 0) {
                     break;
                 }
                 done += static_cast<u64>(n);
+                tail_hole = false;
+            }
+            if (done == len && tail_hole && ftruncate(wfd, static_cast<off_t>(len)) != 0) {
+                done = 0;
             }
             close(wfd);
             // link, not rename: when processes with this layout start together, the first file stays and every one
