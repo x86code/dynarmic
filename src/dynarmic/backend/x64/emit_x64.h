@@ -89,7 +89,13 @@ public:
 
     /// x86Code: lock-free GetBasicBlock for the dispatcher hit path (shared translations: GetBasicBlock needs the
     /// shared mutex, this does not). nullptr = not known here; the caller falls back to the locked path.
-    CodePtr LookupEntrypoint(IR::LocationDescriptor descriptor) const { return lf_map.Lookup(descriptor.Value()); }
+    CodePtr LookupEntrypoint(IR::LocationDescriptor descriptor) const {
+        const u64 k = descriptor.Value();
+        if (const u32 i = sl_map.Lookup(k, static_image.blocks); i != StaticSlotMap::kNone) {
+            return static_image.code_begin + static_image.blocks[i].off;
+        }
+        return lf_map.Lookup(k);
+    }
     /// x86Code debug (GETBLOCK_FD_VERIFY): descriptor whose block starts at ep (block_descriptors, then the static
     /// image); 0 if none. Linear; call only on a mismatch, with the shared mutex held.
     u64 OwnerOf(CodePtr ep) const;
@@ -228,6 +234,43 @@ protected:
         static Table* Alloc(size_t n);
         static void Insert(Table* t, u64 k, CodePtr c);
     } lf_map;
+    // x86Code (Speed 15): registered AOT image blocks, in 8-byte slots (32-bit key fingerprint, image block index + 1,
+    // bit 31 = killed) instead of lf_map's 16-byte key/code entries: the full key is checked in the image's (shared,
+    // file-backed) block table. SpringBoard / Maps / Preferences register 430-620K image blocks (lf_map was 16 MB of
+    // anon in each). Same publication, growth and removal rules as lf_map; a killed slot keeps its chain.
+    struct StaticSlotMap {
+        static constexpr u32 kNone = ~u32{0};
+        struct Table {
+            u64 mask;
+            u64 pad;
+            std::atomic<u64> e[1];
+        };
+        std::atomic<Table*> table{nullptr};
+        size_t used = 0;
+        StaticSlotMap();
+        ~StaticSlotMap();
+        static size_t Hash(u64 k) { return (k * 0x9E3779B97F4A7C15ull) >> 24; }
+        static u64 Fp(u64 k) { return ((k * 0xC2B2AE3D27D4EB4Full) >> 32) << 32; }
+        template<typename B>
+        u32 Lookup(u64 k, const B* blocks) const {
+            const Table* t = table.load(std::memory_order_acquire);
+            const u64 fp = Fp(k);
+            for (size_t i = Hash(k) & t->mask;; i = (i + 1) & t->mask) {
+                const u64 e = t->e[i].load(std::memory_order_acquire);
+                if (e == 0) return kNone;
+                if ((e & ~u64{0xffffffff}) == fp && !(e & 0x80000000u)) {
+                    const u32 idx = static_cast<u32>(e & 0x7fffffff) - 1;
+                    if (blocks[idx].desc == k) return idx;
+                }
+            }
+        }
+        // idx < 2^31 - 1; descs: the image's block table as u64 words, a block's key at descs[idx * stride] (for growth)
+        void Set(u64 k, u32 idx, const u64* descs, size_t stride);
+        void Kill(u64 k, u32 idx);  // marks the slot of (k, idx) killed
+        void Clear();
+        size_t MemoryBytes() const { return (table.load()->mask + 1) * sizeof(u64); }
+        static Table* Alloc(size_t n);
+    } sl_map;
     PatchTable patch_information;
 
     // x86Code (Speed 7): the AOT image's metadata as sorted arrays, in a file mapped shared by every process with the

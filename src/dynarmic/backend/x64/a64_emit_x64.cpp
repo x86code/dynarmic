@@ -1424,12 +1424,12 @@ std::string A64EmitX64::MemoryReport() const {
     char buf[512];
     std::snprintf(buf, sizeof buf,
                   "block_descriptors %.1f (%zu) patch_information %.1f (%zu) block_ranges %.1f fastmem %.1f (%zu) "
-                  "relocs %.1f lf_map %.1f static %zu blocks (%zu registered, %zu dead bits) %zu links %zu fm %s",
+                  "relocs %.1f lf_map %.1f sl_map %.1f static %zu blocks (%zu registered, %zu dead bits) %zu links %zu fm %s",
                   mb(block_descriptors.bucket_count() * (sizeof(IR::LocationDescriptor) + sizeof(BlockDescriptor) + 8)), block_descriptors.size(),
                   mb(patch_information.MemoryBytes()), patch_information.size(),
                   mb(block_ranges.MemoryBytes()),
                   mb(fastmem_patch_info.MemoryBytes()), fastmem_patch_info.size(),
-                  mb(reloc_entries.capacity() * sizeof(RelocEntry)), mb(lf_map.MemoryBytes()),
+                  mb(reloc_entries.capacity() * sizeof(RelocEntry)), mb(lf_map.MemoryBytes()), mb(sl_map.MemoryBytes()),
                   static_image.n_blocks, static_image.registered, static_image.dead.size() * 64, static_image.n_links,
                   fastmem_patch_info.static_size(), static_image.map ? "mapped" : (static_image.active ? "private" : "off"));
     return buf;

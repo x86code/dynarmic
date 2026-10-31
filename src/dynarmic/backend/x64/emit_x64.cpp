@@ -125,6 +125,77 @@ void EmitX64::LockFreeBlockMap::Set(u64 k, CodePtr c) {
     Insert(t, k, c);
 }
 
+EmitX64::StaticSlotMap::Table* EmitX64::StaticSlotMap::Alloc(size_t n) {
+    void* p = mmap(nullptr, 16 + n * sizeof(u64), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    ASSERT(p != MAP_FAILED);
+    Table* t = static_cast<Table*>(p);
+    t->mask = n - 1;
+    return t;
+}
+
+EmitX64::StaticSlotMap::StaticSlotMap() {
+    table.store(Alloc(size_t{1} << 12), std::memory_order_release);
+}
+
+EmitX64::StaticSlotMap::~StaticSlotMap() {
+    Table* t = table.load();
+    munmap(t, 16 + (t->mask + 1) * sizeof(u64));
+}
+
+void EmitX64::StaticSlotMap::Set(u64 k, u32 idx, const u64* descs, size_t stride) {
+    Table* t = table.load(std::memory_order_relaxed);
+    if ((used + 1) * 4 > (t->mask + 1) * 3) {
+        const size_t n = (t->mask + 1) * 2;
+        Table* nt = Alloc(n);
+        used = 0;
+        for (size_t i = 0; i <= t->mask; i++) {
+            const u64 e = t->e[i].load(std::memory_order_relaxed);
+            if (!e || (e & 0x80000000u)) continue;
+            const u64 key = descs[(static_cast<u32>(e & 0x7fffffff) - 1) * stride];
+            for (size_t j = Hash(key) & nt->mask;; j = (j + 1) & nt->mask) {
+                if (!nt->e[j].load(std::memory_order_relaxed)) {
+                    nt->e[j].store(e, std::memory_order_relaxed);
+                    break;
+                }
+            }
+            used++;
+        }
+        table.store(nt, std::memory_order_release);
+        madvise(t, 16 + (t->mask + 1) * sizeof(u64), MADV_DONTNEED);
+        t = nt;
+    }
+    const u64 v = Fp(k) | (idx + 1);
+    for (size_t i = Hash(k) & t->mask;; i = (i + 1) & t->mask) {
+        const u64 e = t->e[i].load(std::memory_order_relaxed);
+        if (e == v) return;
+        if (e == 0) {
+            t->e[i].store(v, std::memory_order_release);
+            used++;
+            return;
+        }
+    }
+}
+
+void EmitX64::StaticSlotMap::Kill(u64 k, u32 idx) {
+    Table* t = table.load(std::memory_order_relaxed);
+    const u64 v = Fp(k) | (idx + 1);
+    for (size_t i = Hash(k) & t->mask;; i = (i + 1) & t->mask) {
+        const u64 e = t->e[i].load(std::memory_order_relaxed);
+        if (e == 0) return;
+        if (e == v) {
+            t->e[i].store(e | 0x80000000u, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+void EmitX64::StaticSlotMap::Clear() {
+    Table* t = table.load(std::memory_order_relaxed);
+    for (size_t i = 0; i <= t->mask; i++) {
+        if (const u64 e = t->e[i].load(std::memory_order_relaxed)) t->e[i].store(e | 0x80000000u, std::memory_order_release);
+    }
+}
+
 void EmitX64::LockFreeBlockMap::Clear() {
     Table* t = table.load(std::memory_order_relaxed);
     for (size_t i = 0; i <= t->mask; i++) {
@@ -144,7 +215,8 @@ std::optional<EmitX64::BlockDescriptor> EmitX64::GetBasicBlock(IR::LocationDescr
             const BlockDescriptor bd{static_image.code_begin + b.off, b.size, 1};
             if (!static_image.Live(i)) {
                 static_image.SetLive(i, true);
-                lf_map.Set(descriptor.Value(), bd.entrypoint);
+                sl_map.Set(descriptor.Value(), static_cast<u32>(i), reinterpret_cast<const u64*>(static_image.blocks),
+                           sizeof(StaticImage::Block) / sizeof(u64));
                 static_image.registered++;
             }
             return bd;
@@ -545,6 +617,7 @@ void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
 void EmitX64::ClearCache() {
     block_descriptors.clear();
     lf_map.Clear();
+    sl_map.Clear();
     patch_information.clear();
     static_image.Reset();
 
@@ -566,7 +639,7 @@ void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>
                 static_image.Kill(i);
                 if (static_image.Live(i)) {
                     static_image.SetLive(i, false);
-                    lf_map.Set(descriptor.Value(), nullptr);
+                    sl_map.Kill(descriptor.Value(), static_cast<u32>(i));
                 }
                 known = true;
             }
