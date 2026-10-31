@@ -45,6 +45,9 @@ void EmitContext::EraseInstruction(IR::Inst* inst) {
 EmitX64::EmitX64(BlockOfCode& code)
         : code(code) {
     exception_handler.Register(code);
+    // x86Code (Speed 11): 32 B buckets, filled to at most 0.5 by default (SpringBoard: 16 MB for 210k blocks). Lookups
+    // here are on the locked path only (the dispatcher uses lf_map).
+    block_descriptors.max_load_factor(0.9f);
 }
 
 EmitX64::~EmitX64() = default;

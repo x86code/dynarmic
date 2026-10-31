@@ -142,6 +142,8 @@ protected:
     // std::vector (40 B buckets for every block ever registered, since Patch() used operator[]): SpringBoard 195 MB.
     class PatchTable {
     public:
+        // x86Code (Speed 11): robin hood probing stays short at 0.9; the default 0.5 left half of the 24 B buckets empty
+        PatchTable() { heads.max_load_factor(0.9f); }
         void Add(const IR::LocationDescriptor& target, PatchInformation::Kind kind, CodePtr site) {
             u32& head = heads[target.Value()];
             sites.push_back(reinterpret_cast<u64>(site) | (static_cast<u64>(kind) << 62));
