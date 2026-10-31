@@ -93,6 +93,9 @@ struct UserCallbacks {
     virtual std::uint16_t MemoryRead16(VAddr vaddr) = 0;
     virtual std::uint32_t MemoryRead32(VAddr vaddr) = 0;
     virtual std::uint64_t MemoryRead64(VAddr vaddr) = 0;
+    /// x86Code: the current value of a 64-bit slot the code loads a branch target from (an import stub's GOT entry),
+    /// or nullopt when it cannot be read safely. Used only for guarded direct links (A64StubLinkPass).
+    virtual std::optional<std::uint64_t> MemoryReadConstant64(VAddr) { return std::nullopt; }
     virtual Vector MemoryRead128(VAddr vaddr) = 0;
 
     // Writes through these callbacks may not be aligned.
@@ -298,6 +301,9 @@ struct UserConfig {
     /// x86Code: an "svc; ret" thunk block skips PushRSB and ends in FastDispatchHint (not PopRSBHint, which is
     /// ReturnFromRunCode with RSB off), so the ret block runs without leaving Run(). Frontend only.
     bool fuse_svc_ret = false;
+
+    /// x86Code: import stubs link directly to their GOT slot's current target, guarded (A64StubLinkPass).
+    bool link_import_stubs = false;
 
     /// x86Code: when non-zero, the block at this guest PC is emitted as a hand-written x86 objc_msgSend
     /// cache probe (no A64 translate, no CallSVC). Hits FastDispatch to the IMP; misses go to uncached.

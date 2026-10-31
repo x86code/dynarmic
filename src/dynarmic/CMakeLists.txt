@@ -259,6 +259,7 @@ if ("A64" IN_LIST DYNARMIC_FRONTENDS)
         ir/opt/a64_callback_config_pass.cpp
         ir/opt/a64_get_set_elimination_pass.cpp
         ir/opt/a64_merge_interpret_blocks.cpp
+        ir/opt/a64_stub_link_pass.cpp
     )
 endif()
 

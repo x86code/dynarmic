@@ -504,6 +504,9 @@ private:
             if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
                 Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
             }
+            if (conf.link_import_stubs && conf.HasOptimization(OptimizationFlag::ConstProp)) {
+                Optimization::A64StubLinkPass(ir_block, conf.callbacks);
+            }
             Optimization::IdentityRemovalPass(ir_block);
             Optimization::VerificationPass(ir_block);
             const size_t guest_instructions = ir_block.CycleCount();
