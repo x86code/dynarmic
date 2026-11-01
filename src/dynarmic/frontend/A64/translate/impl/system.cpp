@@ -14,6 +14,11 @@ enum class SystemRegisterEncoding : u32 {
     CNTFRQ_EL0 = 0b11'1110'011'000'0000,
     // Counter-timer Physical Count register
     CNTPCT_EL0 = 0b11'1110'011'001'0000,
+    // x86Code: Counter-timer Virtual Count register (CNTVOFF is 0 for user code on Apple platforms: same as CNTPCT),
+    // and the self-synchronized views (FEAT_ECV): JavaScriptCore's WTF::UnbarrieredMonotonicTime reads CNTVCT_EL0
+    CNTVCT_EL0 = 0b11'1110'011'010'0000,
+    CNTPCTSS_EL0 = 0b11'1110'011'101'0000,
+    CNTVCTSS_EL0 = 0b11'1110'011'110'0000,
     // Cache Type Register
     CTR_EL0 = 0b11'0000'011'001'0000,
     // Data Cache Zero ID register
@@ -125,6 +130,9 @@ bool TranslatorVisitor::MRS(Imm<1> o0, Imm<3> op1, Imm<4> CRn, Imm<4> CRm, Imm<3
         X(32, Rt, ir.GetCNTFRQ());
         return true;
     case SystemRegisterEncoding::CNTPCT_EL0:
+    case SystemRegisterEncoding::CNTVCT_EL0:
+    case SystemRegisterEncoding::CNTPCTSS_EL0:
+    case SystemRegisterEncoding::CNTVCTSS_EL0:
         // HACK: Ensure that this is the first instruction in the block it's emitted in, so the cycle count is most up-to-date.
         if (!ir.block.empty() && !options.wall_clock_cntpct) {
             ir.block.CycleCount()--;
