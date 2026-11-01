@@ -432,7 +432,7 @@ struct PersistHeader {
 struct LinkPersist {
     u64 target;  // LocationDescriptor of the linked-to block
     u32 site_off;
-    u8 kind;     // PatchInformation::Kind (JG/JZ/JMP; MOV_RCX sites are not persisted)
+    u8 kind;     // PatchInformation::Kind (JG/JZ/JMP, and MOV_RCX since Speed 25)
     u8 pad[3]{};
 };
 
@@ -622,6 +622,29 @@ size_t A64EmitX64::SaveChunk(const std::string& path, const u8 cache_uuid[16], u
             }
         });
     }
+    // x86Code Speed 25: PushRSB's `mov rcx, imm64` sites. The live imm64 may hold a patched block pointer while its
+    // reloc entry still has the emit-time kind, and the target block may not be persisted at all (the slab is int3
+    // filler there): a loading process pushed that pointer and its return jumped into int3 (SIGTRAP in launchd_sim
+    // once RSB was on). Save every site in its unlinked form (ReturnFromRun, with that reloc kind) and as a link, so
+    // the loader patches it to the loaded block or leaves it going through the dispatcher.
+    {
+        std::unordered_map<u32, size_t> reloc_at;
+        for (size_t i = 0; i < relocs.size(); i++) reloc_at[relocs[i].offset] = i;
+        const u64 ret = reinterpret_cast<u64>(code.GetReturnFromRunCodeAddress());
+        for_each_site([&](u64, PatchInformation::Kind kind, CodePtr site) {
+            const u64 sa = reinterpret_cast<u64>(site);
+            if (kind != PatchInformation::MOV_RCX || sa < begin_u + base_off || sa + 10 > end_u || !in_persisted[sa - begin_u - base_off]) {
+                return;
+            }
+            std::memcpy(slab.data() + (sa + 2 - begin_u - base_off), &ret, 8);
+            const u32 off = static_cast<u32>(sa + 2 - begin_u);
+            if (auto it = reloc_at.find(off); it != reloc_at.end()) {
+                relocs[it->second].kind = RelocKind::ReturnFromRun;
+            } else {
+                relocs.push_back(RelocEntry{off, RelocKind::ReturnFromRun});
+            }
+        });
+    }
     std::vector<u8> pool(static_cast<size_t>(code.GetConstantPoolUsedBytes()));
     if (!pool.empty() && pool.size() <= code.GetConstantPoolTotalBytes()) {
         std::memcpy(pool.data(), code.GetConstantPoolData(), pool.size());
@@ -630,7 +653,7 @@ size_t A64EmitX64::SaveChunk(const std::string& path, const u8 cache_uuid[16], u
     std::vector<LinkPersist> links;
     for_each_site([&](u64 target, PatchInformation::Kind kind, CodePtr site) {
         const u64 sa = reinterpret_cast<u64>(site);
-        if (kind == PatchInformation::MOV_RCX || sa < begin_u + base_off || sa + 8 > end_u || !in_persisted[sa - begin_u - base_off]) {
+        if (sa < begin_u + base_off || sa + (kind == PatchInformation::MOV_RCX ? 10 : 8) > end_u || !in_persisted[sa - begin_u - base_off]) {
             return;
         }
         LinkPersist l{};
@@ -1328,7 +1351,7 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         patch_information.clear();
     }
     for (const auto& l : (lazy ? decltype(links){} : links)) {
-        if (static_cast<u64>(l.site_off) + 8 > hdr.code_size || l.kind > PatchInformation::JMP) {
+        if (static_cast<u64>(l.site_off) + 10 > hdr.code_size || l.kind > PatchInformation::MOV_RCX) {
             continue;
         }
         CodePtr site = begin + l.site_off;
