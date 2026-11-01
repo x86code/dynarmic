@@ -89,6 +89,12 @@ struct A64JitState {
     // shared by two threads, and without the lock one thread's STXR could compare against the other's LDXR value)
     alignas(16) std::uint64_t own_excl_value[2]{};
     std::uint64_t own_excl_address = 0;
+    // x86Code Speed 25: return stack buffer under shared translations. Another thread's Invalidate/ClearCache bumps
+    // the shared invalidate_gen (*invalidate_gen_ptr); a pop whose rsb_gen differs drops this thread's entries and
+    // takes the FastDispatch path, so a stale code pointer is never jumped to (the same check-then-jump window as a
+    // FastDispatch entry).
+    const volatile std::uint64_t* invalidate_gen_ptr = nullptr;
+    std::uint64_t rsb_gen = 0;
 };
 
 #ifdef _MSC_VER

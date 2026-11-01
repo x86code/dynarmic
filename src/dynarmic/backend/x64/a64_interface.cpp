@@ -178,6 +178,8 @@ public:
                 rsb_invalidate_gen = gen;
                 jit_state.ResetRSB();
             }
+            jit_state.invalidate_gen_ptr = &shared->invalidate_gen;
+            jit_state.rsb_gen = rsb_invalidate_gen;
         }
 
         is_executing = true;
