@@ -84,6 +84,11 @@ struct A64JitState {
     // instead of baking ASLR-sensitive Imm64s (warm MAPERR on ldxr/stxr lock word).
     void* excl_lock_ptr = nullptr;
     void* excl_addresses_base = nullptr;  // ExclusiveMonitor::exclusive_addresses.data()
+    // x86Code: with Unsafe_IgnoreGlobalMonitor and shared translations, excl_address_ptr/excl_value_ptr point here: a
+    // reservation private to this thread (processor_id is a counter mod the monitor size, so monitor slots can be
+    // shared by two threads, and without the lock one thread's STXR could compare against the other's LDXR value)
+    alignas(16) std::uint64_t own_excl_value[2]{};
+    std::uint64_t own_excl_address = 0;
 };
 
 #ifdef _MSC_VER
