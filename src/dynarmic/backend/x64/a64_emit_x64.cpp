@@ -5,6 +5,11 @@
 
 #include <cerrno>
 #include <dirent.h>
+#include <dlfcn.h>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <ctime>
 #include <sys/mman.h>
 #include <thread>
 #include <signal.h>
@@ -1007,6 +1012,38 @@ bool BuildHugeCopy(const std::string& map_path, int mfd, const std::string& hp, 
 }
 
 
+// Speed 35: starts a64hugecopy MAP HP unless a fresh HP.building marker says one runs. A raw clone without CLONE_VM
+// and with no exit signal: the guest gets no SIGCHLD and its wait4(-1) never sees the child (only __WCLONE does);
+// a64hugecopy forks the copy away at once, so the wait here is short.
+void SpawnHugeCopy(const std::string& map_path, const std::string& hp) {
+    struct stat ks {};
+    if (stat((hp + ".building").c_str(), &ks) == 0 && time(nullptr) - ks.st_mtime < 300) {
+        return;
+    }
+    Dl_info di{};
+    if (!dladdr(reinterpret_cast<void*>(&SpawnHugeCopy), &di) || !di.dli_fname) {
+        return;
+    }
+    std::string helper = di.dli_fname;
+    helper = helper.substr(0, helper.rfind('/') + 1) + "a64hugecopy";
+    if (access(helper.c_str(), X_OK) != 0) {
+        return;
+    }
+    const char* argv[] = {helper.c_str(), map_path.c_str(), hp.c_str(), nullptr};
+    const char* envp[] = {nullptr};
+    const long pid = syscall(SYS_clone, CLONE_VFORK, 0, 0, 0, 0);
+    if (pid == 0) {
+        syscall(SYS_close_range, 3, ~0u, 0);
+        syscall(SYS_execve, argv[0], argv, envp);
+        syscall(SYS_exit, 127);
+    }
+    if (pid > 0) {
+        int st = 0;
+        while (waitpid(static_cast<pid_t>(pid), &st, __WCLONE) < 0 && errno == EINTR) {
+        }
+    }
+}
+
 int HugeImageFd(const std::string& map_path, int mfd) {
     if (const char* e = std::getenv("X86CODE_A64_AOT_HUGE"); e && std::atoi(e) == 0) {
         return -1;
@@ -1033,37 +1070,14 @@ int HugeImageFd(const std::string& map_path, int mfd) {
     if (access((hp + ".small").c_str(), F_OK) == 0) {
         return -1;
     }
-    // Speed 34: the copy (2-5 s for ~1.7 GB) used to run here, in the first process to open the new image, under the
-    // layout lock. Now one process starts it on a detached thread (marker hp.building, O_EXCL; a marker whose pid is
-    // gone or older than 120 s is taken over) and maps the .map itself meanwhile; processes started after the copy is
-    // linked in map the copy. Opt-in (X86CODE_A64_AOT_HUGE_BG=1): on the 27.2 phone the copy thread (started in
-    // UserEventAgent) vanished after ~350 MB, leaving the marker and the partial tmp file; default: foreground copy.
-    static const bool bg = [] { const char* e = std::getenv("X86CODE_A64_AOT_HUGE_BG"); return e && std::atoi(e) == 1; }();
-    const std::string mk = hp + ".building";
-    if (bg) {
-        int k = open(mk.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-        if (k < 0) {
-            struct stat ks {};
-            char buf[32] = {};
-            const int r = open(mk.c_str(), O_RDONLY | O_CLOEXEC);
-            const ssize_t n = r >= 0 ? read(r, buf, sizeof buf - 1) : -1;
-            if (r >= 0) {
-                close(r);
-            }
-            const pid_t owner = n > 0 ? static_cast<pid_t>(std::atoi(buf)) : 0;
-            const bool alive = owner > 0 && (kill(owner, 0) == 0 || errno == EPERM);
-            if (alive && stat(mk.c_str(), &ks) == 0 && time(nullptr) - ks.st_mtime < 120) {
-                return -1;  // being built: map the .map itself
-            }
-            unlink(mk.c_str());
-            k = open(mk.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-            if (k < 0) {
-                return -1;
-            }
-        }
-        const std::string me = std::to_string(getpid());
-        (void)!write(k, me.data(), me.size());
-        close(k);
+    // Speed 35: the copy no longer runs in a guest. The first process that finds no copy (and no fresh build marker)
+    // starts linux/arm64jit's a64hugecopy next to libarm64jit.so (its own Linux process, detached) and maps the .map
+    // itself, like every process until the copy is linked in. Speed 34's foreground copy (2-5 s in the first open after
+    // an image change, under the layout lock) is opt-in: X86CODE_A64_AOT_HUGE_FG=1.
+    static const bool fg = [] { const char* e = std::getenv("X86CODE_A64_AOT_HUGE_FG"); return e && std::atoi(e) == 1; }();
+    if (!fg) {
+        SpawnHugeCopy(map_path, hp);
+        return -1;
     }
     if (DIR* dp = opendir(dir.c_str())) {
         while (dirent* de = readdir(dp)) {
@@ -1073,19 +1087,6 @@ int HugeImageFd(const std::string& map_path, int mfd) {
             }
         }
         closedir(dp);
-    }
-    if (bg) {
-        const int dfd = dup(mfd);
-        if (dfd < 0) {
-            unlink(mk.c_str());
-            return -1;
-        }
-        std::thread([map_path, dfd, hp, len, mk] {
-            BuildHugeCopy(map_path, dfd, hp, len);
-            close(dfd);
-            unlink(mk.c_str());
-        }).detach();
-        return -1;
     }
     if (!BuildHugeCopy(map_path, mfd, hp, len)) {
         return -1;
