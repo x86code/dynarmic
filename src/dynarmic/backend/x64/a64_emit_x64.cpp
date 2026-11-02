@@ -4,6 +4,7 @@
  */
 
 #include <cerrno>
+#include <dirent.h>
 #include <sys/mman.h>
 #include <sys/file.h>
 #include <unistd.h>
@@ -923,6 +924,122 @@ void SharePrelude(const std::string& aot_path, u64 lo, u64 hi) {
     }
     close(fd);
 }
+
+// Speed 28: the shared relocated image (.map) on huge pages. A copy on tmpfs (X86CODE_A64_AOT_HUGE_DIR, default
+// /tmp/x86code-a64-img: RAM; the container's /dev/shm is noexec) is filled through a MADV_HUGEPAGE mapping, so its
+// page-cache folios are 2 MB (the mounts are huge=advise); every process maps it MAP_PRIVATE with MADV_HUGEPAGE and
+// read faults map whole PMDs (the code region base is 2 MB aligned, so addresses and file offsets agree mod 2 MB).
+// One copy per layout name; others in the directory are dropped when a new one is built (mapped ones stay alive
+// until their processes exit). X86CODE_A64_AOT_HUGE=0: map the .map file itself as before. Caller holds the layout lock.
+int HugeImageFd(const std::string& map_path, int mfd) {
+    if (const char* e = std::getenv("X86CODE_A64_AOT_HUGE"); e && std::atoi(e) == 0) {
+        return -1;
+    }
+    struct stat ms {};
+    if (mfd < 0 || fstat(mfd, &ms) != 0 || ms.st_size <= 0) {
+        return -1;
+    }
+    const u64 len = static_cast<u64>(ms.st_size);
+    const char* d = std::getenv("X86CODE_A64_AOT_HUGE_DIR");
+    const std::string dir = d ? d : "/tmp/x86code-a64-img";
+    mkdir(dir.c_str(), 0755);
+    const std::string base = map_path.substr(map_path.rfind('/') + 1);
+    const std::string hp = dir + "/" + base;
+    int fd = open(hp.c_str(), O_RDONLY | O_CLOEXEC);
+    struct stat st {};
+    if (fd >= 0 && fstat(fd, &st) == 0 && static_cast<u64>(st.st_size) == len) {
+        return fd;
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    // this boot's earlier attempt got mostly small pages (fragmented host memory): no copy, map the .map itself
+    if (access((hp + ".small").c_str(), F_OK) == 0) {
+        return -1;
+    }
+    if (DIR* dp = opendir(dir.c_str())) {
+        while (dirent* de = readdir(dp)) {
+            const std::string n = de->d_name;
+            if (n != "." && n != ".." && n != base && n.find(".map") != std::string::npos) {
+                unlinkat(dirfd(dp), n.c_str(), 0);
+            }
+        }
+        closedir(dp);
+    }
+    const std::string tmp = hp + ".tmp." + std::to_string(getpid());
+    const int w = open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (w < 0) {
+        return -1;
+    }
+    bool ok = ftruncate(w, static_cast<off_t>(len)) == 0;
+    void* m = ok ? mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, w, 0) : MAP_FAILED;
+    ok = m != MAP_FAILED;
+    if (ok) {
+        madvise(m, len, MADV_HUGEPAGE);
+        u64 done = 0;
+        while (done < len) {
+            const ssize_t n = pread(mfd, static_cast<u8*>(m) + done, std::min<u64>(len - done, 64ull << 20), static_cast<off_t>(done));
+            if (n <= 0) {
+                break;
+            }
+            done += static_cast<u64>(n);
+        }
+        ok = done == len;
+#ifdef MADV_COLLAPSE
+        if (ok) {
+            madvise(m, len, MADV_COLLAPSE);  // best effort: folios the fault path left small
+        }
+#endif
+        // keep the copy only when most of it is huge folios (PMD-mapped through this mapping); a 4 KB copy would just
+        // double the image's RAM
+        u64 pmd_kb = 0;
+        if (ok) {
+            if (FILE* sm = std::fopen("/proc/self/smaps", "r")) {
+                char line[512];
+                bool in = false;
+                while (std::fgets(line, sizeof line, sm)) {
+                    unsigned long a, b;
+                    if (std::sscanf(line, "%lx-%lx ", &a, &b) == 2) {
+                        in = a == reinterpret_cast<u64>(m);
+                    } else if (in && std::sscanf(line, "ShmemPmdMapped: %lu", &a) == 1) {
+                        pmd_kb = a;
+                    }
+                }
+                std::fclose(sm);
+            }
+            if (pmd_kb * 1024 * 2 < len) {
+                std::fprintf(stderr, "a64jitcache: huge image copy got %llu of %llu MB on 2 MB pages; mapping %s\n",
+                             static_cast<unsigned long long>(pmd_kb >> 10), static_cast<unsigned long long>(len >> 20), map_path.c_str());
+                ok = false;
+                if (const int mk = open((hp + ".small").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0644); mk >= 0) {
+                    close(mk);
+                }
+            }
+        }
+        munmap(m, len);
+    }
+    close(w);
+    if (!ok || (link(tmp.c_str(), hp.c_str()) != 0 && errno != EEXIST)) {
+        unlink(tmp.c_str());
+        return -1;
+    }
+    unlink(tmp.c_str());
+    return open(hp.c_str(), O_RDONLY | O_CLOEXEC);
+}
+
+// Maps [lo, hi) of the image from the huge copy when there is one (else from mfd) at file offset off.
+void* MapImageRange(const std::string& map_path, int mfd, u64 lo, u64 hi, off_t off) {
+    const int hfd = HugeImageFd(map_path, mfd);
+    void* m = mmap(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_FIXED,
+                   hfd >= 0 ? hfd : mfd, off);
+    if (hfd >= 0) {
+        if (m != MAP_FAILED) {
+            madvise(m, hi - lo, MADV_HUGEPAGE);
+        }
+        close(hfd);
+    }
+    return m;
+}
 }  // namespace
 
 size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
@@ -1064,8 +1181,7 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
             const u64 head = std::min(ceil_u, end_u64) - begin_u64;
             bool ok = pread(mfd, begin, head, static_cast<off_t>(begin_u64 - floor_u)) == static_cast<ssize_t>(head);
             if (ok && end_ceil > ceil_u) {
-                void* m = mmap(reinterpret_cast<void*>(ceil_u), end_ceil - ceil_u, PROT_READ | PROT_WRITE | PROT_EXEC,
-                               MAP_PRIVATE | MAP_FIXED, mfd, static_cast<off_t>(ceil_u - floor_u));
+                void* m = MapImageRange(map_path, mfd, ceil_u, end_ceil, static_cast<off_t>(ceil_u - floor_u));
                 ok = m != MAP_FAILED;
             }
             mapped = ok;
@@ -1427,8 +1543,7 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
                 }
                 if (same) {
                     // identical bytes: swapping the private pages for the file's is invisible to the code
-                    mmap(reinterpret_cast<void*>(ceil_u), end_ceil - ceil_u, PROT_READ | PROT_WRITE | PROT_EXEC,
-                         MAP_PRIVATE | MAP_FIXED, mfd, static_cast<off_t>(ceil_u - floor_u));
+                    MapImageRange(map_path, mfd, ceil_u, end_ceil, static_cast<off_t>(ceil_u - floor_u));
                 }
                 if (mfd >= 0) {
                     close(mfd);
@@ -1620,6 +1735,17 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
                     locations.insert(IR::LocationDescriptor{b->desc});
                 }
             }
+        }
+    }
+    // X86CODE_A64_INVAL_DEBUG=<path prefix> (debug): blocks found per range invalidation, to <prefix>.<pid>
+    if (static const bool dbg = std::getenv("X86CODE_A64_INVAL_DEBUG") != nullptr; dbg) {
+        size_t known = 0;
+        for (const auto& l : locations) known += block_descriptors.count(l);
+        static FILE* df = std::fopen((std::string(std::getenv("X86CODE_A64_INVAL_DEBUG")) + "." + std::to_string(getpid())).c_str(), "a");
+        if (df) {
+            std::fprintf(df, "a64 invalidate: %zu ranges [%#llx..] -> %zu locations, %zu registered\n", ranges.iterative_size(),
+                         ranges.empty() ? 0ull : static_cast<unsigned long long>(boost::icl::first(*ranges.begin())), locations.size(), known);
+            std::fflush(df);
         }
     }
     InvalidateBasicBlocks(locations);
