@@ -24,6 +24,7 @@
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/constants.h"
 #include "dynarmic/backend/x64/emit_x64.h"
+#include "dynarmic/backend/x64/emit_x64_frint.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/common/fp/info.h"
 #include "dynarmic/common/fp/op.h"
@@ -1684,24 +1685,12 @@ void EmitFPVectorRoundInt(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     const bool exact = inst->GetArg(2).GetU1();
 
     if constexpr (fsize != 16) {
-        if (code.HasHostFeature(HostFeature::SSE41) && rounding != FP::RoundingMode::ToNearest_TieAwayFromZero && !exact) {
-            const u8 round_imm = [&]() -> u8 {
-                switch (rounding) {
-                case FP::RoundingMode::ToNearest_TieEven:
-                    return 0b00;
-                case FP::RoundingMode::TowardsPlusInfinity:
-                    return 0b10;
-                case FP::RoundingMode::TowardsMinusInfinity:
-                    return 0b01;
-                case FP::RoundingMode::TowardsZero:
-                    return 0b11;
-                default:
-                    UNREACHABLE();
-                }
-            }();
-
+        // x86Code Speed 34: every mode inline (FRINTA / FRINTX were software calls); see emit_x64_frint.h.
+        if (code.HasHostFeature(HostFeature::SSE41) && (fsize == 32 || code.HasHostFeature(HostFeature::SSE42))) {
             EmitTwoOpVectorOperation<fsize, DefaultIndexer, 3>(code, ctx, inst, [&](const Xbyak::Xmm& result, const Xbyak::Xmm& xmm_a) {
-                FCODE(roundp)(result, xmm_a, round_imm);
+                const Xbyak::Xmm a = ctx.reg_alloc.ScratchXmm(), b = ctx.reg_alloc.ScratchXmm();
+                code.movaps(result, xmm_a);
+                EmitFrint<fsize, true>(code, result, a, b, rounding, exact);
             });
 
             return;
@@ -2015,10 +2004,17 @@ void EmitFPVectorToFixed(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     [[maybe_unused]] const bool fpcr_controlled = inst->GetArg(3).GetU1();
 
     if constexpr (fsize != 16) {
-        if (code.HasHostFeature(HostFeature::SSE41) && rounding != FP::RoundingMode::ToNearest_TieAwayFromZero) {
+        // x86Code Speed 34: FCVTAS / FCVTAU (ties away) inline as well (emit_x64_frint.h).
+        const bool tie_away = rounding == FP::RoundingMode::ToNearest_TieAwayFromZero;
+        if (code.HasHostFeature(HostFeature::SSE41) && (!tie_away || fsize == 32 || code.HasHostFeature(HostFeature::SSE42))) {
             auto args = ctx.reg_alloc.GetArgumentInfo(inst);
 
             const Xbyak::Xmm src = ctx.reg_alloc.UseScratchXmm(args[0]);
+            Xbyak::Xmm ta, tb;
+            if (tie_away) {
+                ta = ctx.reg_alloc.ScratchXmm();
+                tb = ctx.reg_alloc.ScratchXmm();
+            }
 
             MaybeStandardFPSCRValue(code, ctx, fpcr_controlled, [&] {
                 const int round_imm = [&] {
@@ -2067,7 +2063,11 @@ void EmitFPVectorToFixed(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
                     FCODE(mulp)(src, GetVectorOf<fsize>(code, scale_factor));
                 }
 
-                FCODE(roundp)(src, src, static_cast<u8>(round_imm));
+                if (tie_away) {
+                    EmitFrint<fsize, true>(code, src, ta, tb, rounding, true);
+                } else {
+                    FCODE(roundp)(src, src, static_cast<u8>(round_imm));
+                }
                 ZeroIfNaN<fsize>(code, src);
 
                 constexpr u64 float_upper_limit_signed = fsize == 32 ? 0x4f000000 : 0x43e0000000000000;

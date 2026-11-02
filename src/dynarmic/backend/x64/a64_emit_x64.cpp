@@ -6,6 +6,8 @@
 #include <cerrno>
 #include <dirent.h>
 #include <sys/mman.h>
+#include <thread>
+#include <signal.h>
 #include <sys/file.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -941,45 +943,12 @@ void SharePrelude(const std::string& aot_path, u64 lo, u64 hi) {
 // read faults map whole PMDs (the code region base is 2 MB aligned, so addresses and file offsets agree mod 2 MB).
 // One copy per layout name; others in the directory are dropped when a new one is built (mapped ones stay alive
 // until their processes exit). X86CODE_A64_AOT_HUGE=0: map the .map file itself as before. Caller holds the layout lock.
-int HugeImageFd(const std::string& map_path, int mfd) {
-    if (const char* e = std::getenv("X86CODE_A64_AOT_HUGE"); e && std::atoi(e) == 0) {
-        return -1;
-    }
-    struct stat ms {};
-    if (mfd < 0 || fstat(mfd, &ms) != 0 || ms.st_size <= 0) {
-        return -1;
-    }
-    const u64 len = static_cast<u64>(ms.st_size);
-    const char* d = std::getenv("X86CODE_A64_AOT_HUGE_DIR");
-    const std::string dir = d ? d : "/tmp/x86code-a64-img";
-    mkdir(dir.c_str(), 0755);
-    const std::string base = map_path.substr(map_path.rfind('/') + 1);
-    const std::string hp = dir + "/" + base;
-    int fd = open(hp.c_str(), O_RDONLY | O_CLOEXEC);
-    struct stat st {};
-    if (fd >= 0 && fstat(fd, &st) == 0 && static_cast<u64>(st.st_size) == len) {
-        return fd;
-    }
-    if (fd >= 0) {
-        close(fd);
-    }
-    // this boot's earlier attempt got mostly small pages (fragmented host memory): no copy, map the .map itself
-    if (access((hp + ".small").c_str(), F_OK) == 0) {
-        return -1;
-    }
-    if (DIR* dp = opendir(dir.c_str())) {
-        while (dirent* de = readdir(dp)) {
-            const std::string n = de->d_name;
-            if (n != "." && n != ".." && n != base && n.find(".map") != std::string::npos) {
-                unlinkat(dirfd(dp), n.c_str(), 0);
-            }
-        }
-        closedir(dp);
-    }
+// Speed 34: fills hp (huge-page tmpfs copy of the .map) from mfd; false when it failed or got small pages.
+bool BuildHugeCopy(const std::string& map_path, int mfd, const std::string& hp, u64 len) {
     const std::string tmp = hp + ".tmp." + std::to_string(getpid());
     const int w = open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (w < 0) {
-        return -1;
+        return false;
     }
     bool ok = ftruncate(w, static_cast<off_t>(len)) == 0;
     void* m = ok ? mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, w, 0) : MAP_FAILED;
@@ -1031,9 +1000,96 @@ int HugeImageFd(const std::string& map_path, int mfd) {
     close(w);
     if (!ok || (link(tmp.c_str(), hp.c_str()) != 0 && errno != EEXIST)) {
         unlink(tmp.c_str());
-        return -1;
+        return false;
     }
     unlink(tmp.c_str());
+    return true;
+}
+
+
+int HugeImageFd(const std::string& map_path, int mfd) {
+    if (const char* e = std::getenv("X86CODE_A64_AOT_HUGE"); e && std::atoi(e) == 0) {
+        return -1;
+    }
+    struct stat ms {};
+    if (mfd < 0 || fstat(mfd, &ms) != 0 || ms.st_size <= 0) {
+        return -1;
+    }
+    const u64 len = static_cast<u64>(ms.st_size);
+    const char* d = std::getenv("X86CODE_A64_AOT_HUGE_DIR");
+    const std::string dir = d ? d : "/tmp/x86code-a64-img";
+    mkdir(dir.c_str(), 0755);
+    const std::string base = map_path.substr(map_path.rfind('/') + 1);
+    const std::string hp = dir + "/" + base;
+    int fd = open(hp.c_str(), O_RDONLY | O_CLOEXEC);
+    struct stat st {};
+    if (fd >= 0 && fstat(fd, &st) == 0 && static_cast<u64>(st.st_size) == len) {
+        return fd;
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    // this boot's earlier attempt got mostly small pages (fragmented host memory): no copy, map the .map itself
+    if (access((hp + ".small").c_str(), F_OK) == 0) {
+        return -1;
+    }
+    // Speed 34: the copy (2-5 s for ~1.7 GB) used to run here, in the first process to open the new image, under the
+    // layout lock. Now one process starts it on a detached thread (marker hp.building, O_EXCL; a marker whose pid is
+    // gone or older than 120 s is taken over) and maps the .map itself meanwhile; processes started after the copy is
+    // linked in map the copy. Opt-in (X86CODE_A64_AOT_HUGE_BG=1): on the 27.2 phone the copy thread (started in
+    // UserEventAgent) vanished after ~350 MB, leaving the marker and the partial tmp file; default: foreground copy.
+    static const bool bg = [] { const char* e = std::getenv("X86CODE_A64_AOT_HUGE_BG"); return e && std::atoi(e) == 1; }();
+    const std::string mk = hp + ".building";
+    if (bg) {
+        int k = open(mk.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (k < 0) {
+            struct stat ks {};
+            char buf[32] = {};
+            const int r = open(mk.c_str(), O_RDONLY | O_CLOEXEC);
+            const ssize_t n = r >= 0 ? read(r, buf, sizeof buf - 1) : -1;
+            if (r >= 0) {
+                close(r);
+            }
+            const pid_t owner = n > 0 ? static_cast<pid_t>(std::atoi(buf)) : 0;
+            const bool alive = owner > 0 && (kill(owner, 0) == 0 || errno == EPERM);
+            if (alive && stat(mk.c_str(), &ks) == 0 && time(nullptr) - ks.st_mtime < 120) {
+                return -1;  // being built: map the .map itself
+            }
+            unlink(mk.c_str());
+            k = open(mk.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+            if (k < 0) {
+                return -1;
+            }
+        }
+        const std::string me = std::to_string(getpid());
+        (void)!write(k, me.data(), me.size());
+        close(k);
+    }
+    if (DIR* dp = opendir(dir.c_str())) {
+        while (dirent* de = readdir(dp)) {
+            const std::string n = de->d_name;
+            if (n != "." && n != ".." && n.compare(0, base.size(), base) != 0 && n.find(".map") != std::string::npos) {
+                unlinkat(dirfd(dp), n.c_str(), 0);
+            }
+        }
+        closedir(dp);
+    }
+    if (bg) {
+        const int dfd = dup(mfd);
+        if (dfd < 0) {
+            unlink(mk.c_str());
+            return -1;
+        }
+        std::thread([map_path, dfd, hp, len, mk] {
+            BuildHugeCopy(map_path, dfd, hp, len);
+            close(dfd);
+            unlink(mk.c_str());
+        }).detach();
+        return -1;
+    }
+    if (!BuildHugeCopy(map_path, mfd, hp, len)) {
+        return -1;
+    }
     return open(hp.c_str(), O_RDONLY | O_CLOEXEC);
 }
 

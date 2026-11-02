@@ -28,6 +28,7 @@
 #include "dynarmic/common/fp/info.h"
 #include "dynarmic/common/fp/op.h"
 #include "dynarmic/common/fp/rounding_mode.h"
+#include "dynarmic/backend/x64/emit_x64_frint.h"
 #include "dynarmic/common/lut_from_list.h"
 #include "dynarmic/interface/optimization_flags.h"
 #include "dynarmic/ir/basic_block.h"
@@ -1074,14 +1075,18 @@ static void EmitFPRound(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, siz
     const bool exact = inst->GetArg(2).GetU1();
     const auto round_imm = ConvertRoundingModeToX64Immediate(rounding_mode);
 
-    if (fsize != 16 && code.HasHostFeature(HostFeature::SSE41) && round_imm && !exact) {
+    // x86Code Speed 34: every mode inline (FRINTA / FRINTX were software calls); see emit_x64_frint.h.
+    (void)round_imm;
+    if (fsize != 16 && code.HasHostFeature(HostFeature::SSE41) && (fsize == 32 || code.HasHostFeature(HostFeature::SSE42))) {
         if (fsize == 64) {
             FPTwoOp<64>(code, ctx, inst, [&](Xbyak::Xmm result) {
-                code.roundsd(result, result, *round_imm);
+                const Xbyak::Xmm a = ctx.reg_alloc.ScratchXmm(), b = ctx.reg_alloc.ScratchXmm();
+                EmitFrint<64, false>(code, result, a, b, rounding_mode, exact);
             });
         } else {
             FPTwoOp<32>(code, ctx, inst, [&](Xbyak::Xmm result) {
-                code.roundss(result, result, *round_imm);
+                const Xbyak::Xmm a = ctx.reg_alloc.ScratchXmm(), b = ctx.reg_alloc.ScratchXmm();
+                EmitFrint<32, false>(code, result, a, b, rounding_mode, exact);
             });
         }
 
@@ -1632,7 +1637,10 @@ static void EmitFPToFixed(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
         // cvttsd2si truncates during operation so rounding (and thus SSE4.1) not required
         const bool truncating = rounding_mode == FP::RoundingMode::TowardsZero;
 
-        if (round_imm && (truncating || code.HasHostFeature(HostFeature::SSE41))) {
+        // x86Code Speed 34: FCVTAS / FCVTAU (ties away) inline as well (emit_x64_frint.h; IXC kept: exact form).
+        const bool tie_away = rounding_mode == FP::RoundingMode::ToNearest_TieAwayFromZero && code.HasHostFeature(HostFeature::SSE41) && (fsize == 32 || code.HasHostFeature(HostFeature::SSE42));
+
+        if ((round_imm && (truncating || code.HasHostFeature(HostFeature::SSE41))) || tie_away) {
             const Xbyak::Xmm src = ctx.reg_alloc.UseScratchXmm(args[0]);
             const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr().cvt64();
 
@@ -1642,7 +1650,10 @@ static void EmitFPToFixed(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
                     code.mulsd(src, code.Const(xword, scale_factor));
                 }
 
-                if (!truncating) {
+                if (tie_away) {
+                    const Xbyak::Xmm ta = ctx.reg_alloc.ScratchXmm(), tb = ctx.reg_alloc.ScratchXmm();
+                    EmitFrint<64, false>(code, src, ta, tb, rounding_mode, true);
+                } else if (!truncating) {
                     code.roundsd(src, src, *round_imm);
                 }
             } else {
@@ -1651,7 +1662,10 @@ static void EmitFPToFixed(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
                     code.mulss(src, code.Const(xword, scale_factor));
                 }
 
-                if (!truncating) {
+                if (tie_away) {
+                    const Xbyak::Xmm ta = ctx.reg_alloc.ScratchXmm(), tb = ctx.reg_alloc.ScratchXmm();
+                    EmitFrint<32, false>(code, src, ta, tb, rounding_mode, true);
+                } else if (!truncating) {
                     code.roundss(src, src, *round_imm);
                 }
 
