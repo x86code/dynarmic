@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include "dynarmic/common/vma_name.h"
 #include "dynarmic/backend/x64/block_of_code.h"
 
 #ifdef _WIN32
@@ -114,6 +115,7 @@ public:
         if (p == MAP_FAILED) {
             throw Xbyak::Error(Xbyak::ERR_CANT_ALLOC);
         }
+        NameVma(p, size, "a64:codecache");
         std::memcpy(p, &size, sizeof(size_t));
         return static_cast<uint8_t*>(p) + DYNARMIC_PAGE_SIZE;
     }

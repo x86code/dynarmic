@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include "dynarmic/common/vma_name.h"
 #include <cerrno>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -96,6 +97,7 @@ A64EmitX64::FastDispatchStorage::FastDispatchStorage(BlockOfCode& code) : size(g
         p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     }
     ASSERT(p != MAP_FAILED);
+    NameVma(p, bytes, "a64:fastdispatch");
     table = static_cast<FastDispatchEntry*>(p);
 }
 

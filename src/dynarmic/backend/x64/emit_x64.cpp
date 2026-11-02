@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include "dynarmic/common/vma_name.h"
 #include <sys/mman.h>
 #include "dynarmic/backend/x64/emit_x64.h"
 
@@ -55,6 +56,7 @@ EmitX64::~EmitX64() = default;
 EmitX64::LockFreeBlockMap::Table* EmitX64::LockFreeBlockMap::Alloc(size_t n) {
     void* p = mmap(nullptr, 16 + n * sizeof(Entry), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     ASSERT(p != MAP_FAILED);
+    NameVma(p, 16 + n * sizeof(Entry), "a64:lfmap");
     Table* t = static_cast<Table*>(p);  // zero pages == empty entries
     t->mask = n - 1;
     return t;
@@ -128,6 +130,7 @@ void EmitX64::LockFreeBlockMap::Set(u64 k, CodePtr c) {
 EmitX64::StaticSlotMap::Table* EmitX64::StaticSlotMap::Alloc(size_t n) {
     void* p = mmap(nullptr, 16 + n * sizeof(u64), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     ASSERT(p != MAP_FAILED);
+    NameVma(p, 16 + n * sizeof(u64), "a64:slmap");
     Table* t = static_cast<Table*>(p);
     t->mask = n - 1;
     return t;
