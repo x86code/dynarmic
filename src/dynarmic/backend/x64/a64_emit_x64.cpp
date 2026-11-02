@@ -464,6 +464,16 @@ void A64EmitX64::EmitMovAbs64(const Xbyak::Reg64& reg, u64 value, RelocKind kind
     code.mov(reg, value);
 }
 
+std::vector<u64> A64EmitX64::DynamicDescriptors(u64 lo, u64 hi) {
+    std::unique_lock lock{shared_mutex};
+    std::vector<u64> v;
+    for (const auto& [loc, bd] : block_descriptors) {  // static (image) blocks never go in here
+        const u64 pc = A64::LocationDescriptor{loc}.PC();
+        if (bd.persistable && pc >= lo && pc < hi) v.push_back(loc.Value());
+    }
+    return v;
+}
+
 size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                        u64 cache_lo, u64 cache_hi) {
     return SaveChunk(path, cache_uuid, build_id, cache_lo, cache_hi, kWholeSlab);

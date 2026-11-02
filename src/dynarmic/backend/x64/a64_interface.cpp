@@ -34,6 +34,26 @@
 
 namespace Dynarmic::A64 {
 
+// x86Code Speed 31 (debug): X86CODE_A64_LIVE_BINS=<file>: live translations binned by guest PC (dyld cache, placed
+// Mach-Os in the cache window's top, anything else = unplaced app / plug-in code), rewritten every 256 blocks.
+static void LiveBin(u64 pc, size_t insns, size_t bytes) {
+    static const char* path = getenv("X86CODE_A64_LIVE_BINS");
+    if (!path) return;
+    static std::atomic<u64> n[3][3];
+    const int b = pc >= 0x1c0000000ull && pc < 0x2ac000000ull ? 0 : pc >= 0x2ac000000ull && pc < 0x2c0000000ull ? 1 : 2;
+    n[b][0]++; n[b][1] += insns; n[b][2] += bytes;
+    if ((n[0][0] + n[1][0] + n[2][0]) % 256) return;
+    char f[512];
+    snprintf(f, sizeof f, "%s.%d", path, (int)getpid());
+    if (FILE* o = fopen(f, "w")) {
+        const char* nm[3] = {"cache", "placed", "other"};
+        for (int i = 0; i < 3; i++)
+            fprintf(o, "%s blocks %llu insns %llu x86 %llu\n", nm[i], (unsigned long long)n[i][0].load(), (unsigned long long)n[i][1].load(), (unsigned long long)n[i][2].load());
+        fclose(o);
+    }
+}
+
+
 using namespace Backend::X64;
 
 static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*LookupBlock)(void* lookup_block_arg), void* arg, const A64::UserConfig& conf) {
@@ -88,6 +108,10 @@ struct Jit::SharedCode final {
 
 Jit::SharedStats Jit::GetSharedStats(const SharedCode& shared) {
     return shared.stats;
+}
+
+std::vector<std::uint64_t> Jit::GetDynamicDescriptors(SharedCode& shared, std::uint64_t lo, std::uint64_t hi) {
+    return shared.emitter.DynamicDescriptors(lo, hi);
 }
 
 void Jit::SetCodeCacheAddress(std::uint64_t address) {
@@ -555,6 +579,7 @@ private:
             shared->stats.guest_instructions += guest_instructions;
             shared->stats.code_bytes += block_of_code.getCurr<const u8*>() - start_code;
             shared->stats.translate_ns += (t1.tv_sec - t0.tv_sec) * 1000000000ull + t1.tv_nsec - t0.tv_nsec;
+            LiveBin(A64::LocationDescriptor{current_location}.PC(), guest_instructions, block_of_code.getCurr<const u8*>() - start_code);
             return entrypoint;
         }
     }
