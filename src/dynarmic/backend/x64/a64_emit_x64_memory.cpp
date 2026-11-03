@@ -519,6 +519,14 @@ void Extend(BlockOfCode& code, const Xbyak::Reg64& dst, const Xbyak::Reg64& src,
     }
 }
 
+// Darwin's top-byte-ignore: plain loads/stores reach a tagged address through the fastmem fallback (inline check or
+// fault -> callback), atomics have no fallback site (a tagged address used to assert "not a fastmem patch location").
+// Drop the tag inline instead: two shifts on a scratch copy of the address.
+void StripTag(BlockOfCode& code, const Xbyak::Reg64& vaddr) {
+    code.shl(vaddr, 8);
+    code.shr(vaddr, 8);
+}
+
 }  // namespace
 
 void A64EmitX64::EmitA64AtomicRMW(A64EmitContext& ctx, IR::Inst* inst) {
@@ -536,7 +544,8 @@ void A64EmitX64::EmitA64AtomicRMW(A64EmitContext& ctx, IR::Inst* inst) {
 
     if (op == 0 || op == 8) {
         const Xbyak::Reg64 value = ctx.reg_alloc.UseScratchGpr(args[1]);
-        const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[0]);
+        const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseScratchGpr(args[0]);
+        StripTag(code, vaddr);
         const auto mem = SizedPtr(code, log2, FastmemBase(conf, vaddr));
         if (op == 0) {
             code.lock();
@@ -551,7 +560,8 @@ void A64EmitX64::EmitA64AtomicRMW(A64EmitContext& ctx, IR::Inst* inst) {
 
     ctx.reg_alloc.ScratchGpr(HostLoc::RAX);
     const Xbyak::Reg64 operand = ctx.reg_alloc.UseScratchGpr(args[1]);
-    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[0]);
+    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseScratchGpr(args[0]);
+    StripTag(code, vaddr);
     const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr();
     const Xbyak::Reg64 cur = ctx.reg_alloc.ScratchGpr();
     const bool is_signed = op == 4 || op == 5;
@@ -612,7 +622,8 @@ void A64EmitX64::EmitA64AtomicCAS(A64EmitContext& ctx, IR::Inst* inst) {
 
     ctx.reg_alloc.UseScratch(args[1], HostLoc::RAX);
     const Xbyak::Reg64 desired = ctx.reg_alloc.UseGpr(args[2]);
-    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[0]);
+    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseScratchGpr(args[0]);
+    StripTag(code, vaddr);
     code.lock();
     code.cmpxchg(SizedPtr(code, log2, FastmemBase(conf, vaddr)), SizedReg(desired, log2));
     Extend(code, rax, rax, log2, false);
@@ -628,7 +639,8 @@ void A64EmitX64::EmitA64AtomicCAS128(A64EmitContext& ctx, IR::Inst* inst) {
     ctx.reg_alloc.ScratchGpr(HostLoc::RDX);
     const Xbyak::Xmm expected = ctx.reg_alloc.UseXmm(args[1]);
     const Xbyak::Xmm desired = ctx.reg_alloc.UseXmm(args[2]);
-    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[0]);
+    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseScratchGpr(args[0]);
+    StripTag(code, vaddr);
     const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
 
     code.movq(rax, expected);
