@@ -24,6 +24,20 @@
 
 namespace Dynarmic::Backend::X64 {
 
+// x86Code RAM 3: see A64::UserConfig::fastmem_unchecked
+inline bool FastmemUnchecked(const A64::UserConfig& conf) {
+    return conf.fastmem_unchecked && conf.fastmem_pointer && *conf.fastmem_pointer == 0 && !conf.silently_mirror_fastmem
+        && conf.fastmem_address_space_bits == 47;
+}
+// The fastmem address of vaddr for code that does not check the range itself (LSE atomics, CAS).
+inline Xbyak::RegExp FastmemBase(const A64::UserConfig& conf, Xbyak::Reg64 vaddr) {
+    if (FastmemUnchecked(conf)) {
+        return vaddr;
+    }
+    return Xbyak::util::r13 + vaddr;
+}
+
+
 class RegAlloc;
 
 struct A64EmitContext final : public EmitContext {
@@ -40,6 +54,8 @@ struct A64EmitContext final : public EmitContext {
     const A64::UserConfig& conf;
     /// x86Code: set when the block emits a HostCall (CallSVC, etc.); those blocks are not persisted.
     bool has_host_call = false;
+    /// x86Code RAM 3: unchecked fastmem, but this block's accesses faulted often: emit the inline check here.
+    bool checked_memory = false;
 };
 
 class A64EmitX64 final : public EmitX64 {
@@ -197,6 +213,17 @@ protected:
     // side map that stays empty when recompile_on_fastmem_failure is false (our default),
     // shrinking ~1.5M-entry bucket storage from ~224 MB (56 B/entry) to ~128 MB (32 B/entry).
     FastmemTable fastmem_patch_info;
+    // x86Code RAM 3 (under the fastmem callback's lock): fastmem faults; fault rip -> count; blocks retranslated with
+    // the inline address check after one of their sites faulted kCheckAfterFaults times (unchecked fastmem only).
+    u64 fastmem_faults = 0;
+    std::map<u64, u64> fault_sites;
+    tsl::robin_set<u64> checked_blocks;
+    size_t checked_retranslations = 0;
+    static constexpr u64 kCheckAfterFaults = 8;
+    void OnFastmemFault(u64 rip);
+public:
+    u64* shared_invalidate_gen = nullptr;  // SharedCode::invalidate_gen (bumped when a block is retranslated checked)
+protected:
     std::vector<FastmemTable::StaticEntry> static_fm_own;  // static fastmem sites when the index file is not mapped
     void PublishStaticIndex(const std::string& idx_path, std::vector<FastmemTable::StaticEntry> fm, std::vector<u64> cbs, bool complete);
     bool MapStaticIndex(const std::string& idx_path, u8* begin);

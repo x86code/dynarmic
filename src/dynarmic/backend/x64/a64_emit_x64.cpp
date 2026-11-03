@@ -119,8 +119,54 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         if (this->conf.shared_translations) {
             lock.lock();
         }
+        OnFastmemFault(rip_);
         return FastmemCallback(rip_);
     });
+}
+
+// x86Code RAM 3: unchecked fastmem faults on an address above 47 bits (Swift's tagged _StringObject pointers,
+// Darwin's top-byte tags). A site that keeps faulting (a few hot Swift string accessors) is not worth a signal per
+// access: after kCheckAfterFaults its block is invalidated and retranslated with the inline check (checked_blocks).
+// Runs in the SIGSEGV handler with the emitter lock held, like dynarmic's recompile_on_fastmem_failure; the faulting
+// thread returns into the old code, which stays in the cache (invalidation only unlinks).
+void A64EmitX64::OnFastmemFault(u64 rip) {
+    fastmem_faults++;
+    if (fault_sites.size() >= 65536 && !fault_sites.count(rip)) {
+        return;
+    }
+    if (++fault_sites[rip] != kCheckAfterFaults || !FastmemUnchecked(conf)) {
+        return;
+    }
+    std::optional<u64> loc;
+    for (const auto& [l, bd] : block_descriptors) {
+        const u64 e = reinterpret_cast<u64>(bd.entrypoint);
+        if (rip >= e && rip < e + bd.size) {
+            loc = l.Value();
+            break;
+        }
+    }
+    if (!loc && static_image.active && rip >= reinterpret_cast<u64>(static_image.code_begin)) {
+        const u64 off = rip - reinterpret_cast<u64>(static_image.code_begin);
+        for (size_t i = 0; i < static_image.n_blocks; i++) {
+            const auto& b = static_image.blocks[i];
+            if (off >= b.off && off < u64(b.off) + b.size && !static_image.Dead(i)) {
+                loc = b.desc;
+                break;
+            }
+        }
+    }
+    if (!loc || !checked_blocks.insert(*loc).second) {
+        return;
+    }
+    checked_retranslations++;
+    if (static const bool log = std::getenv("X86CODE_A64_CHECKLOG") != nullptr; log) {
+        std::fprintf(stderr, "dynarmic: fastmem site %#llx faulted %llu times: block %#llx retranslated with the address check\n",
+                     (unsigned long long)rip, (unsigned long long)kCheckAfterFaults, (unsigned long long)A64::LocationDescriptor{IR::LocationDescriptor{*loc}}.PC());
+    }
+    InvalidateBasicBlocks({IR::LocationDescriptor{*loc}});
+    if (shared_invalidate_gen) {
+        ++*shared_invalidate_gen;
+    }
 }
 
 A64EmitX64::~A64EmitX64() = default;
@@ -169,7 +215,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
         if (conf.page_table) {
             gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R14));
         }
-        if (conf.fastmem_pointer) {
+        if (conf.fastmem_pointer && !FastmemUnchecked(conf)) {
             gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R13));
         }
         return gprs;
@@ -177,6 +223,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 
     RegAlloc reg_alloc{code, gpr_order, any_xmm};
     A64EmitContext ctx{conf, reg_alloc, block};
+    ctx.checked_memory = !checked_blocks.empty() && checked_blocks.count(block.Location().Value());
     code.SetCallFlag(&ctx.has_host_call);
     SCOPE_EXIT {
         code.SetCallFlag(nullptr);
@@ -1448,9 +1495,19 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
         }
         fm_bound++;
         // Abort stub shape: call wrapped_fn; <resume>. Patch E8 rel32 immediately before resume.
-        if (fm.resume_off >= 5) {
+        // x86Code RAM 3: only for a site with an out-of-line stub. An unchecked site (no stub) resumes right after its
+        // own load/store, so the 5 bytes before resume are that instruction (a 0xE8 there is e.g. the disp8 of
+        // [rax-0x18]): never patch inside it. A stub lies after the block body: resume - fault > 15 (the longest x86
+        // instruction), and the old call target is a fallback in the prelude.
+        const u64 prelude_begin = reinterpret_cast<u64>(code.getCode());
+        if (fm.resume_off >= 5 && fm.resume_off - fm.fault_off > 15) {
             u8* call_site = begin + static_cast<size_t>(fm.resume_off) - 5;
-            if (call_site[0] == 0xE8) {
+            s32 old_rel;
+            std::memcpy(&old_rel, call_site + 1, sizeof(old_rel));
+            // rel32 moves with the code: the prelude sits right before begin in both processes
+            const u64 old_target = static_cast<u64>(static_cast<s64>(reinterpret_cast<u64>(call_site) + 5) + old_rel);
+            const bool to_prelude = old_target >= prelude_begin && old_target < new_begin;
+            if (call_site[0] == 0xE8 && to_prelude) {
                 const u64 next = reinterpret_cast<u64>(call_site) + 5;
                 const s32 rel = static_cast<s32>(static_cast<s64>(reinterpret_cast<u64>(fn) - next));
                 if (std::memcmp(call_site + 1, &rel, sizeof(rel)) != 0) {  // no write (page copy) when unchanged
@@ -1792,7 +1849,26 @@ std::string A64EmitX64::MemoryReport() const {
                   mb(reloc_entries.capacity() * sizeof(RelocEntry)), mb(lf_map.MemoryBytes()), mb(sl_map.MemoryBytes()),
                   static_image.n_blocks, static_image.registered, static_image.dead.size() * 64, static_image.n_links,
                   fastmem_patch_info.static_size(), static_image.map ? "mapped" : (static_image.active ? "private" : "off"));
-    return buf;
+    // x86Code RAM 3: fastmem faults (unchecked accesses with a tagged / out-of-range address, read-only pages)
+    std::string r = buf;
+    std::vector<std::pair<u64, u64>> top;
+    for (const auto& [rip, n] : fault_sites) {
+        top.emplace_back(n, rip);
+    }
+    std::sort(top.rbegin(), top.rend());
+    r += fmt::format(" faults {} at {} sites, {} blocks checked", fastmem_faults, fault_sites.size(), checked_retranslations);
+    for (size_t i = 0; i < top.size() && i < 4; i++) {
+        u64 guest = 0;
+        for (const auto& [loc, bd] : block_descriptors) {
+            const u64 e = reinterpret_cast<u64>(bd.entrypoint);
+            if (top[i].second >= e && top[i].second < e + bd.size) {
+                guest = A64::LocationDescriptor{loc}.PC();
+                break;
+            }
+        }
+        r += fmt::format(" {:#x}x{} (block {:#x})", top[i].second, top[i].first, guest);
+    }
+    return r;
 }
 
 void A64EmitX64::ClearCache() {

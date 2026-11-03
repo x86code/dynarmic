@@ -92,15 +92,28 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
     const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
 
     SharedLabel abort = GenSharedLabel(), end = GenSharedLabel();
+    bool end_bound = false;
 
     if (fastmem_marker) {
         // Use fastmem
-        bool require_abort_handling;
+        bool require_abort_handling = false;
         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
 
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
-        ctx.deferred_emits.emplace_back([=, this, &ctx] {
+        if (!require_abort_handling && !conf.check_halt_on_memory_access) {
+            // x86Code RAM 3: no inline check, so no out-of-line stub: a fault calls the fallback and returns here.
+            code.L(*end);
+            end_bound = true;
+            const u64 loc = mcl::bit_cast<u64>(location);
+            fastmem_patch_info.emplace(loc, FastmemPatchInfo{
+                mcl::bit_cast<u64>(code.getCurr()),
+                mcl::bit_cast<u64>(wrapped_fn),
+            });
+            if (conf.recompile_on_fastmem_failure) {
+                fastmem_recompile_markers.emplace(loc, *fastmem_marker);
+            }
+        } else ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
             code.call(wrapped_fn);
 
@@ -129,7 +142,9 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
             code.jmp(*end, code.T_NEAR);
         });
     }
-    code.L(*end);
+    if (!end_bound) {
+        code.L(*end);
+    }
 
     if constexpr (bitsize == 128) {
         ctx.reg_alloc.DefineValue(inst, Xbyak::Xmm{value_idx});
@@ -179,15 +194,28 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
     const auto wrapped_fn = write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
 
     SharedLabel abort = GenSharedLabel(), end = GenSharedLabel();
+    bool end_bound = false;
 
     if (fastmem_marker) {
         // Use fastmem
-        bool require_abort_handling;
+        bool require_abort_handling = false;
         const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
 
         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
 
-        ctx.deferred_emits.emplace_back([=, this, &ctx] {
+        if (!require_abort_handling && !conf.check_halt_on_memory_access) {
+            // x86Code RAM 3: no inline check, so no out-of-line stub: a fault calls the fallback and returns here.
+            code.L(*end);
+            end_bound = true;
+            const u64 loc = mcl::bit_cast<u64>(location);
+            fastmem_patch_info.emplace(loc, FastmemPatchInfo{
+                mcl::bit_cast<u64>(code.getCurr()),
+                mcl::bit_cast<u64>(wrapped_fn),
+            });
+            if (conf.recompile_on_fastmem_failure) {
+                fastmem_recompile_markers.emplace(loc, *fastmem_marker);
+            }
+        } else ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
             code.call(wrapped_fn);
 
@@ -216,7 +244,9 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
             code.jmp(*end, code.T_NEAR);
         });
     }
-    code.L(*end);
+    if (!end_bound) {
+        code.L(*end);
+    }
 }
 
 template<std::size_t bitsize, auto callback>

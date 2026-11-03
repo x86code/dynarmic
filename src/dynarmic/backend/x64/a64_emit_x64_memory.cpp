@@ -537,7 +537,7 @@ void A64EmitX64::EmitA64AtomicRMW(A64EmitContext& ctx, IR::Inst* inst) {
     if (op == 0 || op == 8) {
         const Xbyak::Reg64 value = ctx.reg_alloc.UseScratchGpr(args[1]);
         const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[0]);
-        const auto mem = SizedPtr(code, log2, r13 + vaddr);
+        const auto mem = SizedPtr(code, log2, FastmemBase(conf, vaddr));
         if (op == 0) {
             code.lock();
             code.xadd(mem, SizedReg(value, log2));
@@ -562,7 +562,7 @@ void A64EmitX64::EmitA64AtomicRMW(A64EmitContext& ctx, IR::Inst* inst) {
         code.not_(operand);
     }
 
-    const auto mem = SizedPtr(code, log2, r13 + vaddr);
+    const auto mem = SizedPtr(code, log2, FastmemBase(conf, vaddr));
     switch (log2) {
     case 0: code.movzx(eax, mem); break;
     case 1: code.movzx(eax, mem); break;
@@ -614,7 +614,7 @@ void A64EmitX64::EmitA64AtomicCAS(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 desired = ctx.reg_alloc.UseGpr(args[2]);
     const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[0]);
     code.lock();
-    code.cmpxchg(SizedPtr(code, log2, r13 + vaddr), SizedReg(desired, log2));
+    code.cmpxchg(SizedPtr(code, log2, FastmemBase(conf, vaddr)), SizedReg(desired, log2));
     Extend(code, rax, rax, log2, false);
     ctx.reg_alloc.DefineValue(inst, rax);
 }
@@ -645,7 +645,7 @@ void A64EmitX64::EmitA64AtomicCAS128(A64EmitContext& ctx, IR::Inst* inst) {
         code.movq(rcx, result);
     }
     code.lock();
-    code.cmpxchg16b(ptr[r13 + vaddr]);
+    code.cmpxchg16b(ptr[FastmemBase(conf, vaddr)]);
     code.movq(result, rax);
     if (code.HasHostFeature(HostFeature::SSE41)) {
         code.pinsrq(result, rdx, 1);

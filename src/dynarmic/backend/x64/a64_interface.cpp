@@ -91,7 +91,9 @@ struct Jit::SharedCode final {
             : conf(conf_)
             , block_of_code(GenRunCodeCallbacks(conf.callbacks, &LookupBlockThunk, nullptr, conf), JitStateInfo{A64JitState{}}, conf.code_cache_size, GenRCP(conf))
             , emitter(block_of_code, conf, nullptr)
-            , polyfill_options(GenPolyfillOptions(block_of_code)) {}
+            , polyfill_options(GenPolyfillOptions(block_of_code)) {
+        emitter.shared_invalidate_gen = &invalidate_gen;
+    }
 
     static CodePtr LookupBlockThunk(void*);
 

@@ -260,6 +260,11 @@ struct UserConfig {
     /// relevant memory callback.
     /// This is only used if fastmem_pointer is set.
     bool silently_mirror_fastmem = true;
+    /// x86Code (RAM 3): the host checks the address range. With fastmem_pointer == 0 (guest address == host address)
+    /// and fastmem_address_space_bits == 47 on x86-64, an address with any of bits 47-63 set is non-canonical (#GP) or
+    /// kernel space: the access faults and the fastmem fault handler calls the callback. No inline check, no
+    /// out-of-line stub, no r13 base (r13 becomes an allocatable register). Ignored when silently_mirror_fastmem.
+    bool fastmem_unchecked = false;
 
     /// Determines if we should use the above fastmem_pointer for exclusive reads and
     /// writes. On x64, dynarmic currently relies on x64 cmpxchg semantics which may not

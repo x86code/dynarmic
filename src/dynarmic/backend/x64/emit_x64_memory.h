@@ -164,7 +164,22 @@ template<>
 [[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp) {
     const size_t unused_top_bits = 64 - ctx.conf.fastmem_address_space_bits;
 
-    if (unused_top_bits == 0) {
+    if (FastmemUnchecked(ctx.conf)) {
+        // x86Code RAM 3: the hardware checks (non-canonical -> #GP -> fastmem fault handler). r13 is a free register
+        // here; a block whose accesses faulted often gets the inline check (A64EmitX64::OnFastmemFault).
+        if (ctx.checked_memory) {
+            if (!tmp) {
+                tmp = ctx.reg_alloc.ScratchGpr();
+            }
+            code.mov(*tmp, vaddr);
+            code.shr(*tmp, int(ctx.conf.fastmem_address_space_bits));
+            code.jnz(abort, code.T_NEAR);
+            require_abort_handling = true;
+        } else {
+            require_abort_handling = false;
+        }
+        return vaddr;
+    } else if (unused_top_bits == 0) {
         return r13 + vaddr;
     } else if (ctx.conf.silently_mirror_fastmem) {
         if (!tmp) {
