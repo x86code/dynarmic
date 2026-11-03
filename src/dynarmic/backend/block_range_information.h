@@ -11,6 +11,7 @@
 #include <tsl/robin_map.h>
 #include <tsl/robin_set.h>
 
+#include "dynarmic/common/vma_name.h"
 #include "dynarmic/ir/location_descriptor.h"
 
 namespace Dynarmic::Backend {
@@ -36,7 +37,9 @@ private:
     // per page plus a block -> pages map (~150 MB for SpringBoard's 1M blocks). Invalidating a page drops its whole
     // vector; a multi-page block keeps a stale entry on its other pages, which at worst invalidates a newer block of
     // the same location early (it is retranslated).
-    tsl::robin_map<ProgramCounterType, std::vector<u64>> page_blocks;
+    tsl::robin_map<ProgramCounterType, std::vector<u64>, std::hash<ProgramCounterType>, std::equal_to<ProgramCounterType>,
+                   MetaAlloc<std::pair<ProgramCounterType, std::vector<u64>>, kMetaRanges>>
+        page_blocks;
 };
 
 }  // namespace Dynarmic::Backend

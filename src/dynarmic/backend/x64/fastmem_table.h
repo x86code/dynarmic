@@ -13,6 +13,7 @@
 
 #include <mcl/stdint.hpp>
 #include <tsl/robin_map.h>
+#include "dynarmic/common/vma_name.h"
 
 namespace Dynarmic::Backend::X64 {
 
@@ -147,7 +148,7 @@ private:
     size_t static_n = 0;
     std::vector<u64> static_callbacks;
     size_t sorted = 0;
-    std::vector<Entry> entries;
+    std::vector<Entry, MetaAlloc<Entry, kMetaFastmem>> entries;
     tsl::robin_map<u64, FastmemPatchInfo> overflow;
     std::vector<u64> callbacks;
     tsl::robin_map<u64, u32> callback_index;

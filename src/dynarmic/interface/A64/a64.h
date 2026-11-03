@@ -37,6 +37,9 @@ public:
     /// x86Code Speed 31: descriptors of the blocks this process translated itself (not the image's), persistable ones
     /// with a guest PC in [lo, hi) (training feedback from processes that run on the AOT image).
     static std::vector<std::uint64_t> GetDynamicDescriptors(SharedCode& shared, std::uint64_t lo, std::uint64_t hi);
+    /// x86Code RAM 2 (JIT): descriptors of the AOT image's blocks this process has run (registered on lookup), guest PC
+    /// in [lo, hi): with GetDynamicDescriptors, everything the process used (the .live training file's aging).
+    static std::vector<std::uint64_t> GetUsedImageDescriptors(SharedCode& shared, std::uint64_t lo, std::uint64_t hi);
     /// x86Code: host memory held by the shared emitter's maps (memlog; takes the shared lock).
     static std::string GetMemoryReport(SharedCode& shared);
     /// x86Code: dump translated blocks whose guest PC is in [cache_lo, cache_hi) to path.

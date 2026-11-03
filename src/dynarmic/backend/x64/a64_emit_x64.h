@@ -64,6 +64,7 @@ public:
     size_t LoadPersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                u64 cache_lo, u64 cache_hi, bool shared_image = false);
     std::vector<u64> DynamicDescriptors(u64 lo, u64 hi);  // Speed 31 (Jit::GetDynamicDescriptors)
+    std::vector<u64> UsedImageDescriptors(u64 lo, u64 hi);  // RAM 2 (Jit::GetUsedImageDescriptors)
     static std::vector<u64> ReadPersistentDescriptors(const std::string& path, const u8 cache_uuid[16], u64 build_id);
     /// x86Code Speed 18 (chunked AOT image): when set, Emit appends the block's direct successors (link targets, call
     /// return addresses) here, so a static builder can follow them.
@@ -118,7 +119,7 @@ public:
         u32 offset;  // byte offset from GetCodeBegin()
         RelocKind kind;
     };
-    std::vector<RelocEntry> reloc_entries;
+    std::vector<RelocEntry, MetaAlloc<RelocEntry, kMetaRelocs>> reloc_entries;
 
     /// Emit `mov reg, Imm64(value)` and record a reloc when value is relative to `kind`.
     void EmitMovAbs64(const Xbyak::Reg64& reg, u64 value, RelocKind kind);

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <sys/mman.h>
+#include "dynarmic/common/vma_name.h"
 #include <new>
 
 #include <mcl/bitsizeof.hpp>
@@ -184,9 +185,9 @@ protected:
         size_t MemoryBytes() const { return heads.bucket_count() * 24 + sites.capacity() * 8 + next.capacity() * 4; }
 
     private:
-        tsl::robin_map<u64, u32> heads;
-        std::vector<u64> sites;
-        std::vector<u32> next;
+        tsl::robin_map<u64, u32, std::hash<u64>, std::equal_to<u64>, MetaAlloc<std::pair<u64, u32>, kMetaLinks>> heads;
+        std::vector<u64, MetaAlloc<u64, kMetaLinks>> sites;
+        std::vector<u32, MetaAlloc<u32, kMetaLinks>> next;
     };
     void Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
     // x86Code: shared translations. Patch sites are aligned so a link/unlink is one atomic 8-byte store (other threads
@@ -202,7 +203,9 @@ protected:
     // State
     BlockOfCode& code;
     ExceptionHandler exception_handler;
-    tsl::robin_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
+    tsl::robin_map<IR::LocationDescriptor, BlockDescriptor, std::hash<IR::LocationDescriptor>, std::equal_to<IR::LocationDescriptor>,
+                   MetaAlloc<std::pair<IR::LocationDescriptor, BlockDescriptor>, kMetaBlocks>>
+        block_descriptors;
     // x86Code: insert-only open-addressing mirror of block_descriptors (key -> entrypoint), written under the shared
     // mutex (single writer), read without it. Removal clears the code pointer and keeps the key, so probe chains stay
     // intact. A reader may get an entrypoint that is invalidated right after; the locked path had the same window.

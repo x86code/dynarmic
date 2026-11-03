@@ -114,6 +114,10 @@ std::vector<std::uint64_t> Jit::GetDynamicDescriptors(SharedCode& shared, std::u
     return shared.emitter.DynamicDescriptors(lo, hi);
 }
 
+std::vector<std::uint64_t> Jit::GetUsedImageDescriptors(SharedCode& shared, std::uint64_t lo, std::uint64_t hi) {
+    return shared.emitter.UsedImageDescriptors(lo, hi);
+}
+
 void Jit::SetCodeCacheAddress(std::uint64_t address) {
     Backend::X64::SetNextCodeCacheAddress(address);
 }

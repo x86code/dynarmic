@@ -483,6 +483,21 @@ std::vector<u64> A64EmitX64::DynamicDescriptors(u64 lo, u64 hi) {
     return v;
 }
 
+std::vector<u64> A64EmitX64::UsedImageDescriptors(u64 lo, u64 hi) {
+    std::unique_lock lock{shared_mutex};
+    std::vector<u64> v;
+    for (size_t w = 0; static_image.active && w < static_image.live.size(); w++) {
+        for (u64 bits = static_image.live[w]; bits; bits &= bits - 1) {
+            const size_t i = w * 64 + static_cast<size_t>(__builtin_ctzll(bits));
+            if (i >= static_image.n_blocks || static_image.Dead(i)) continue;
+            const u64 d = static_image.blocks[i].desc;
+            const u64 pc = StaticImage::Pc(d);
+            if (pc >= lo && pc < hi) v.push_back(d);
+        }
+    }
+    return v;
+}
+
 size_t A64EmitX64::SavePersistentCache(const std::string& path, const u8 cache_uuid[16], u64 build_id,
                                        u64 cache_lo, u64 cache_hi) {
     return SaveChunk(path, cache_uuid, build_id, cache_lo, cache_hi, kWholeSlab);
@@ -1454,7 +1469,7 @@ size_t A64EmitX64::LoadPersistentCache(const std::string& path, const u8 cache_u
     std::fclose(f);
 
     size_t loaded = 0;
-    reloc_entries = std::move(relocs);  // keep for a later re-save under the new bases
+    reloc_entries.assign(relocs.begin(), relocs.end());  // keep for a later re-save under the new bases
     // Optional diagnostic: X86CODE_A64_JITCACHE_SKIP_RANGE=lo-hi skips registering blocks in
     // [lo, hi) so they retranslate fresh (e.g. to bisect a bad translation).
     u64 skip_lo = 0, skip_hi = 0;
