@@ -14,6 +14,9 @@
 #include <type_traits>
 #include <vector>
 
+#include <sys/mman.h>
+#include <new>
+
 #include <mcl/bitsizeof.hpp>
 #include <tsl/robin_map.h>
 #include <tsl/robin_set.h>
@@ -295,8 +298,46 @@ protected:
         size_t n_blocks = 0;
         const Link* links = nullptr;  // sorted by target
         size_t n_links = 0;
-        std::vector<u64> dead;
-        std::vector<u64> live;  // registered in lf_map (static blocks never go into block_descriptors)
+        // x86Code (RAM 2): one bit per image block, in fresh anonymous zero pages instead of a zero-filled vector.
+        // assign() wrote every word (~0.5 MB per bitset per process for a 4.2M-block image, all private dirty);
+        // here a page becomes resident only when a bit in it is set.
+        struct ZeroBits {
+            u64* w = nullptr;
+            size_t n = 0;  // words
+            ZeroBits() = default;
+            ZeroBits(const ZeroBits&) = delete;
+            ZeroBits& operator=(const ZeroBits&) = delete;
+            ZeroBits(ZeroBits&& o) noexcept : w(o.w), n(o.n) { o.w = nullptr; o.n = 0; }
+            ZeroBits& operator=(ZeroBits&& o) noexcept {
+                if (this != &o) {
+                    Free();
+                    w = o.w;
+                    n = o.n;
+                    o.w = nullptr;
+                    o.n = 0;
+                }
+                return *this;
+            }
+            ~ZeroBits() { Free(); }
+            void Free() {
+                if (w) munmap(w, n * sizeof(u64));
+                w = nullptr;
+                n = 0;
+            }
+            void assign(size_t words, u64 /*zero*/) {
+                Free();
+                if (!words) return;
+                void* p = mmap(nullptr, words * sizeof(u64), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+                if (p == MAP_FAILED) throw std::bad_alloc();
+                w = static_cast<u64*>(p);
+                n = words;
+            }
+            size_t size() const { return n; }
+            u64& operator[](size_t i) { return w[i]; }
+            u64 operator[](size_t i) const { return w[i]; }
+        };
+        ZeroBits dead;
+        ZeroBits live;  // registered in lf_map (static blocks never go into block_descriptors)
         size_t registered = 0;
         void* map = nullptr;
         size_t map_len = 0;

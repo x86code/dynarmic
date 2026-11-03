@@ -1047,7 +1047,10 @@ void SpawnHugeCopy(const std::string& map_path, const std::string& hp) {
 }
 
 int HugeImageFd(const std::string& map_path, int mfd) {
-    if (const char* e = std::getenv("X86CODE_A64_AOT_HUGE"); e && std::atoi(e) == 0) {
+    // Off by default (2026-11-03 defaults A/B, 3 fresh boots each): no measurable speed win over the file mapping
+    // (Settings cold 4.34-4.51 vs 4.26-4.32 s, boot and taps equal), and the tmpfs copy pins the whole image in RAM
+    // (1216 MB) where the page cache holds only touched, reclaimable pages. X86CODE_A64_AOT_HUGE=1 turns it on.
+    if (const char* e = std::getenv("X86CODE_A64_AOT_HUGE"); !(e && std::atoi(e) == 1)) {
         return -1;
     }
     struct stat ms {};
@@ -1786,7 +1789,7 @@ void A64EmitX64::ClearCache() {
     reloc_entries.clear();
 }
 
-void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
+bool A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
     auto locations = block_ranges.InvalidateRanges(ranges);
     if (static_image.active) {
         // static blocks cover one guest insn [pc, pc+3], as block_ranges did for loaded blocks
@@ -1817,7 +1820,11 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
             std::fflush(df);
         }
     }
+    if (locations.empty()) {
+        return false;
+    }
     InvalidateBasicBlocks(locations);
+    return true;
 }
 
 namespace {

@@ -281,8 +281,13 @@ public:
         const auto range = boost::icl::discrete_interval<u64>::closed(start_address, end_address);
         if (conf.shared_translations) {
             std::unique_lock lock{shared->mutex()};
-            ++shared->invalidate_gen;
-            emitter.InvalidateCacheRanges(boost::icl::interval_set<u64>{range});
+            // x86code: bump the generation (every thread drops its whole RSB on its next return) only when a block was
+            // actually unlinked. JavaScriptCore calls sys_icache_invalidate for every code write and patch (thousands
+            // per page load), mostly on freshly written code that was never translated: no RSB entry can point there.
+            // Bumped after the unlink, still under the lock, so a thread seeing the new gen also sees the unlinked blocks.
+            if (emitter.InvalidateCacheRanges(boost::icl::interval_set<u64>{range})) {
+                ++shared->invalidate_gen;
+            }
             return;
         }
         std::unique_lock lock{invalidation_mutex};

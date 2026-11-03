@@ -79,7 +79,8 @@ public:
 
     void ClearCache() override;
 
-    void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
+    // x86code: true when any translated (or static-image) block was found in the ranges
+    bool InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
     /// x86Code Speed 8 (shared translations): GetBlock's FastDispatch probe (one atomic 16-byte read of the entry the
     /// dispatcher would use) and fill (only with the shared mutex held).
