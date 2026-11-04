@@ -112,6 +112,11 @@ Jit::SharedStats Jit::GetSharedStats(const SharedCode& shared) {
     return shared.stats;
 }
 
+void Jit::WithSharedLock(SharedCode& shared, void (*fn)(void*), void* arg) {
+    std::unique_lock lock{shared.mutex()};
+    fn(arg);
+}
+
 std::vector<std::uint64_t> Jit::GetDynamicDescriptors(SharedCode& shared, std::uint64_t lo, std::uint64_t hi) {
     return shared.emitter.DynamicDescriptors(lo, hi);
 }
