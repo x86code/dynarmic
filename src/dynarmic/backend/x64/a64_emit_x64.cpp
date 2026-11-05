@@ -1162,10 +1162,21 @@ int HugeImageFd(const std::string& map_path, int mfd) {
 }
 
 // Maps [lo, hi) of the image from the huge copy when there is one (else from mfd) at file offset off.
+// x86Code RAM 13: the shared image's file mappings stay out of core dumps (X86CODE_A64_IMAGE_DUMP=1 keeps them): a
+// dump reads every mapped page, so each crashing image process faulted the whole 1.3 GB image into the page cache
+// (WebKit's helpers abort on Safari's teardown: one dump pass showed 870 MB of image pages). The code is in the file.
+static void ImageDontDump(void* m, size_t len) {
+    static const bool keep = [] { const char* e = std::getenv("X86CODE_A64_IMAGE_DUMP"); return e && std::atoi(e) == 1; }();
+    if (m != MAP_FAILED && !keep) {
+        madvise(m, len, MADV_DONTDUMP);
+    }
+}
+
 void* MapImageRange(const std::string& map_path, int mfd, u64 lo, u64 hi, off_t off) {
     const int hfd = HugeImageFd(map_path, mfd);
     void* m = mmap(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_FIXED,
                    hfd >= 0 ? hfd : mfd, off);
+    ImageDontDump(m, hi - lo);
     if (hfd >= 0) {
         if (m != MAP_FAILED) {
             madvise(m, hi - lo, MADV_HUGEPAGE);
@@ -1757,6 +1768,7 @@ void A64EmitX64::PublishStaticIndex(const std::string& idx_path, std::vector<Fas
     void* m = MAP_FAILED;
     if (fd >= 0 && fstat(fd, &st) == 0 && static_cast<size_t>(st.st_size) == len) {
         m = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
+        ImageDontDump(m, len);
         if (m != MAP_FAILED && !same(static_cast<const u8*>(m))) {
             const u8* mm = static_cast<const u8*>(m);
             std::fprintf(stderr, "a64jitcache: %s differs from this process's index (hdr %d cbs %d blocks %d links %d fm %d); not mapped\n", idx_path.c_str(),
@@ -1818,6 +1830,7 @@ bool A64EmitX64::MapStaticIndex(const std::string& idx_path, u8* begin) {
     if (m == MAP_FAILED) {
         return false;
     }
+    ImageDontDump(m, len);
     const u8* mb = static_cast<const u8*>(m);
     static_image.Reset();
     static_image.code_begin = begin;

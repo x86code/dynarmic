@@ -129,6 +129,10 @@ void Jit::SetCodeCacheAddress(std::uint64_t address) {
     Backend::X64::SetNextCodeCacheAddress(address);
 }
 
+void Jit::SetHostCallStubs(void* base, std::size_t bytes) {
+    Backend::X64::SetHostCallStubs(base, bytes);
+}
+
 void Jit::SetFastDispatchEntries(std::size_t n) {
     Backend::X64::SetFastDispatchEntries(n);
 }

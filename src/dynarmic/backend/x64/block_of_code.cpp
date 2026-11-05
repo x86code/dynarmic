@@ -22,6 +22,8 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 #include <mcl/assert.hpp>
 #include <mcl/bit/bit_field.hpp>
@@ -60,6 +62,37 @@ std::atomic<u64> g_next_code_cache_address{0};
 
 void SetNextCodeCacheAddress(u64 address) {
     g_next_code_cache_address = address;
+}
+
+namespace {
+std::mutex g_stub_mu;
+u8* g_stub_base = nullptr;
+size_t g_stub_cap = 0, g_stub_used = 0;
+std::unordered_map<u64, u64>* g_stub_map = nullptr;
+}  // namespace
+
+void SetHostCallStubs(void* base, size_t bytes) {
+    std::lock_guard lk{g_stub_mu};
+    g_stub_base = static_cast<u8*>(base);
+    g_stub_cap = bytes / 16;
+    g_stub_used = 0;
+    if (!g_stub_map) g_stub_map = new std::unordered_map<u64, u64>;
+    g_stub_map->clear();
+}
+
+u64 HostCallStub(u64 target, u64 from) {
+    std::lock_guard lk{g_stub_mu};
+    if (!g_stub_base) return 0;
+    const auto in_reach = [from](u64 a) { const u64 d = a - from; return d < 0x80000000ull || d >= 0xFFFFFFFF80000000ull; };
+    if (auto it = g_stub_map->find(target); it != g_stub_map->end()) return in_reach(it->second) ? it->second : 0;
+    if (g_stub_used == g_stub_cap || !in_reach(reinterpret_cast<u64>(g_stub_base))) return 0;
+    u8* s = g_stub_base + 16 * g_stub_used++;
+    std::memcpy(s + 8, &target, 8);  // target first: the jmp is only reached after the call site is emitted
+    const u8 jmp[8] = {0xFF, 0x25, 0x02, 0x00, 0x00, 0x00, 0xCC, 0xCC};
+    std::memcpy(s, jmp, 8);
+    const u64 a = reinterpret_cast<u64>(s);
+    g_stub_map->emplace(target, a);
+    return a;
 }
 
 namespace {

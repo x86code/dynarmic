@@ -37,6 +37,12 @@ struct RunCodeCallbacks {
 
 /// x86Code: the next BlockOfCode is placed at this address when that range is free (shared AOT image).
 void SetNextCodeCacheAddress(u64 address);
+/// x86Code RAM 13: a fixed-address page of host-call stubs (16 bytes each: jmp [rip+2]; int3 x2; u64 target) placed
+/// next to the code cache. CallFunction always emits `call rel32` to a stub, so translated code (the prelude the AOT
+/// image's blocks jump into) never depends on how far the host library is: the cache only needs reach to the stubs.
+void SetHostCallStubs(void* base, size_t bytes);
+/// Stub address for a host function, 0 when no stub page is set, it is full, or it is out of rel32 reach of `from`.
+u64 HostCallStub(u64 target, u64 from);
 void SetFastDispatchEntries(size_t n);  // x86Code: entries (power of two) of FastDispatch tables made after this
 
 class BlockOfCode final : public Xbyak::CodeGenerator {
@@ -91,7 +97,10 @@ public:
         static_assert(std::is_pointer_v<FunctionPointer> && std::is_function_v<std::remove_pointer_t<FunctionPointer>>,
                       "Supplied type must be a pointer to a function");
 
-        const u64 address = reinterpret_cast<u64>(fn);
+        u64 address = reinterpret_cast<u64>(fn);
+        if (const u64 stub = HostCallStub(address, getCurr<u64>() + 5)) {
+            address = stub;
+        }
         const u64 distance = address - (getCurr<u64>() + 5);
         // x86Code: a call into host code (rel32 or abs64) bakes this process's ASLR layout into the block.
         if (call_flag) {
@@ -103,7 +112,7 @@ public:
             mov(rax, address);
             call(rax);
         } else {
-            call(fn);
+            call(reinterpret_cast<const void*>(address));
         }
     }
 
